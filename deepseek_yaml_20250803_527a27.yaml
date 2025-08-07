@@ -1,0 +1,37 @@
+name: Security and Dependency CI
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  push:
+    branches:
+      - main
+jobs:
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: pip install piprot safety
+      
+    - name: Check for outdated packages
+      run: piprot requirements.txt
+      
+    - name: Security audit
+      run: safety check -r requirements.txt --full-report
+      
+    - name: Update dependencies
+      run: |
+        pip install pipupgrade
+        pipupgrade --ignore-error --skip-virtualenv-check --requirements requirements.txt
+        git config user.name "CI Bot"
+        git config user.email "ci@example.com"
+        git add requirements.txt
+        git commit -m "Auto-update dependencies" || echo "No updates"
+        git push

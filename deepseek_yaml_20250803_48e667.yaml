@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  web:
+    build: .
+    command: gunicorn -w 4 -k eventlet -b 0.0.0.0:5000 project.server_start:app
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    ports:
+      - "5000:5000"
+    depends_on:
+      - redis
+      - mlflow
+
+  celery:
+    build: .
+    command: celery -A project.web_setup.celery worker --loglevel=info --pool=eventlet
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:3.1.1
+    environment:
+      - MLFLOW_S3_BUCKET=mlflow-artifacts
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./mlruns:/mlruns

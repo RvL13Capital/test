@@ -1,0 +1,352 @@
+      # Security & Monitoring
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
+      - PROMETHEUS_METRICS_ENABLED=${PROMETHEUS_METRICS_ENABLED:-true}
+      
+      # CORS Configuration
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+      
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    
+    volumes:
+      # Mount GCS credentials securely
+      - ${GCS_CREDENTIALS_PATH:-./credentials/gcs-key.json}:/app/credentials/gcs-key.json:ro
+      # Mount logs for monitoring
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+      - mlflow
+    
+    networks:
+      - secure_network
+    
+    # Security settings
+    user: "1000:1000"  # Run as non-root user
+    read_only: false   # App needs write access for temp files
+    security_opt:
+      - no-new-privileges:true
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  celery-worker:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A project.extensions.celery worker --loglevel=info --pool=eventlet --concurrency=4 --max-tasks-per-child=1000
+    environment:
+      # Same environment variables as web service
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - FLASK_ENV=${FLASK_ENV:-production}
+      
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID}
+      - MODEL_ENCRYPTION_KEY=${MODEL_ENCRYPTION_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcs-key.json
+      
+      - MLFLOW_TRACKING_URI=http://mlflow:5001
+      - MLFLOW_EXPERIMENT_NAME=${MLFLOW_EXPERIMENT_NAME:-SecureTradingSystem}
+      
+      - OPTUNA_N_TRIALS=${OPTUNA_N_TRIALS:-20}
+      - OPTUNA_TIMEOUT=${OPTUNA_TIMEOUT:-1800}
+      - MAX_TRAINING_TIME=${MAX_TRAINING_TIME:-3600}
+      
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
+      
+      - MAX_DATAFRAME_SIZE=${MAX_DATAFRAME_SIZE:-1000000}
+      - ALLOWED_TICKERS=${ALLOWED_TICKERS:-AAPL,GOOGL,MSFT,TSLA,AMZN,META,NFLX,NVDA}
+    
+    volumes:
+      - ${GCS_CREDENTIALS_PATH:-./credentials/gcs-key.json}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+      - mlflow
+    
+    networks:
+      - secure_network
+    
+    # Security settings
+    user: "1000:1000"
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "celery", "-A", "project.extensions.celery", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  celery-beat:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A project.extensions.celery beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    
+    volumes:
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+    
+    networks:
+      - secure_network
+    
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  redis:
+    image: redis:7.2-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-secure_redis_password}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    
+    volumes:
+      - redis_data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    
+    networks:
+      - secure_network
+    
+    # Security settings
+    user: "999:999"  # Redis user
+    security_opt:
+      - no-new-privileges:true
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.2'
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:2.11.1
+    command: mlflow server --host 0.0.0.0 --port 5001 --backend-store-uri /mlruns --serve-artifacts
+    ports:
+      - "${MLFLOW_PORT:-5001}:5001"
+    
+    volumes:
+      - mlflow_data:/mlruns
+      - ./logs:/app/logs
+    
+    networks:
+      - secure_network
+    
+    environment:
+      - MLFLOW_TRACKING_URI=http://0.0.0.0:5001
+    
+    # Security settings
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Monitoring services
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    
+    networks:
+      - secure_network
+    
+    user: "65534:65534"  # nobody user
+    security_opt:
+      - no-new-privileges:true
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    
+    networks:
+      - secure_network
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-secure_admin_password}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    
+    user: "472:472"  # grafana user
+    security_opt:
+      - no-new-privileges:true
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Security scanner (optional, for development)
+  security-scanner:
+    image: owasp/zap2docker-stable
+    command: zap-baseline.py -t http://web:5000 -J zap-report.json
+    volumes:
+      - ./security-reports:/zap/wrk:rw
+    networks:
+      - secure_network
+    profiles:
+      - security-testing
+    depends_on:
+      - web
+
+# Networks
+networks:
+  secure_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volumes
+volumes:
+  redis_data:
+    driver: local
+  mlflow_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: localversion: '3.8'
+
+services:
+  web:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    command: gunicorn -w 4 -k eventlet -b 0.0.0.0:5000 project.server:app --timeout 120 --max-requests 1000 --max-requests-jitter 100
+    environment:
+      # Security Configuration
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - FLASK_ENV=${FLASK_ENV:-production}
+      
+      # Celery Configuration
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      
+      # Rate Limiting
+      - REDIS_URL=redis://redis:6379/1
+      - API_RATE_LIMIT=${API_RATE_LIMIT:-200/hour}
+      - TRAINING_RATE_LIMIT=${TRAINING_RATE_LIMIT:-10/hour}
+      
+      # Data Limits
+      - MAX_DATAFRAME_SIZE=${MAX_DATAFRAME_SIZE:-1000000}
+      - MAX_REQUEST_SIZE=${MAX_REQUEST_SIZE:-16777216}
+      - ALLOWED_TICKERS=${ALLOWED_TICKERS:-AAPL,GOOGL,MSFT,TSLA,AMZN,META,NFLX,NVDA}
+      
+      # Cloud Storage
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID}
+      - MODEL_ENCRYPTION_KEY=${MODEL_ENCRYPTION_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcs-key.json
+      
+      # MLflow
+      - MLFLOW_TRACKING_URI=http://mlflow:5001
+      - MLFLOW_EXPERIMENT_NAME=${MLFLOW_EXPERIMENT_NAME:-SecureTradingSystem}
+      
+      # ML Configuration
+      - OPTUNA_N_TRIALS=${OPTUNA_N_TRIALS:-20}
+      - OPTUNA_TIMEOUT=${OPTUNA_TIMEOUT:-1800}
+      - MAX_TRAINING_TIME=${MAX_TRAINING_TIME:-3600}
+      
+      # Security & Monitoring
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
+      - PROMETHEUS_METRICS_ENABLED=${PROMETHEUS_METRICS_ENABLED:-true}
+      

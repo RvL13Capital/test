@@ -1,0 +1,328 @@
+# docker-compose.production.yml
+version: '3.8'
+
+services:
+  # Main Web Application with Breakout System
+  web:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: gunicorn -w 4 -k gevent -b 0.0.0.0:5000 project.server:app --timeout 300 --max-requests 1000
+    environment:
+      # Core Settings
+      - FLASK_ENV=production
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      
+      # Breakout System
+      - BREAKOUT_SYSTEM_ENABLED=true
+      - NANO_CAP_MAX=50000000
+      - MICRO_CAP_MAX=300000000
+      - SMALL_CAP_MAX=2000000000
+      - MIN_CONSOLIDATION_DAYS=20
+      - MAX_CONSOLIDATION_DAYS=120
+      - OPTIMIZATION_INTERVAL_HOURS=24
+      - PERFORMANCE_THRESHOLD=0.65
+      
+      # GCS Configuration
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID}
+      - MODEL_ENCRYPTION_KEY=${MODEL_ENCRYPTION_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcs-key.json
+      
+      # Redis Configuration
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      
+      # API Limits
+      - API_RATE_LIMIT=1000/hour
+      - BREAKOUT_ANALYSIS_RATE_LIMIT=100/hour
+      - SCREENING_RATE_LIMIT=20/hour
+      
+      # Monitoring
+      - PROMETHEUS_METRICS_ENABLED=true
+      - AUDIT_LOG_ENABLED=true
+      
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    
+    volumes:
+      - ${GCS_CREDENTIALS_PATH:-./credentials/gcs-key.json}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+      - postgres
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health/detailed"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Celery Worker for Breakout Analysis
+  celery-breakout:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: celery -A project.extensions:celery worker --loglevel=info --queues=breakout_analysis,breakout_optimization,breakout_alerts --concurrency=4 --hostname=breakout-worker@%h
+    environment:
+      # Same core environment as web
+      - FLASK_ENV=production
+      - SECRET_KEY=${SECRET_KEY}
+      - BREAKOUT_SYSTEM_ENABLED=true
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcs-key.json
+      - MAX_STOCKS_TO_SCREEN=500
+      - SCREENING_BATCH_SIZE=50
+    
+    volumes:
+      - ${GCS_CREDENTIALS_PATH:-./credentials/gcs-key.json}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+      - postgres
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 6G
+        reservations:
+          cpus: '2.0'
+          memory: 3G
+
+  # GPU Worker for Model Training
+  celery-gpu:
+    build: 
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: breakout-system:gpu
+    command: celery -A project.extensions:celery worker --loglevel=info --queues=training_gpu,breakout_optimization --concurrency=1 --hostname=gpu-worker@%h
+    environment:
+      - FLASK_ENV=production
+      - SECRET_KEY=${SECRET_KEY}
+      - BREAKOUT_SYSTEM_ENABLED=true
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcs-key.json
+      - CUDA_VISIBLE_DEVICES=0
+      - BREAKOUT_MODEL_EPOCHS=100
+      - BREAKOUT_MODEL_BATCH_SIZE=64
+    
+    volumes:
+      - ${GCS_CREDENTIALS_PATH:-./credentials/gcs-key.json}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: celery -A project.extensions:celery beat --loglevel=info
+    environment:
+      - FLASK_ENV=production
+      - SECRET_KEY=${SECRET_KEY}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - BREAKOUT_SYSTEM_ENABLED=true
+    
+    volumes:
+      - ./logs:/app/logs
+    
+    depends_on:
+      - redis
+    
+    networks:
+      - breakout_network
+
+  # Redis with Persistence
+  redis:
+    image: redis:7.2-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-secure_password} --maxmemory 4gb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    
+    volumes:
+      - redis_data:/data
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  # PostgreSQL for Persistent Storage
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=breakout_system
+      - POSTGRES_USER=${POSTGRES_USER:-breakout_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_scripts:/docker-entrypoint-initdb.d
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+
+  # Flower for Celery Monitoring
+  flower:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: celery -A project.extensions:celery flower --port=5555 --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin123}
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    
+    environment:
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD}@redis:6379/0
+    
+    depends_on:
+      - redis
+    
+    networks:
+      - breakout_network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    
+    networks:
+      - breakout_network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin123}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel,grafana-worldmap-panel
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    
+    networks:
+      - breakout_network
+
+  # NGINX Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./static:/usr/share/nginx/html/static:ro
+    
+    depends_on:
+      - web
+    
+    networks:
+      - breakout_network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+# Networks
+networks:
+  breakout_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volumes
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

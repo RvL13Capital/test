@@ -1,0 +1,426 @@
+# docker-compose.optimized.yml
+version: '3.8'
+
+services:
+  # Main Web Application - CPU only for inference
+  web:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: gunicorn -w 4 -k gevent -b 0.0.0.0:5000 project.server:app --timeout 300
+    environment:
+      - FLASK_ENV=production
+      - BREAKOUT_SYSTEM_ENABLED=true
+      - USE_GPU_FOR_INFERENCE=false  # CPU is sufficient for inference
+      - MODEL_CACHE_SIZE=5  # Cache last 5 models in memory
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - POLYGON_API_KEY=${POLYGON_API_KEY}
+      - ALPHA_VANTAGE_API_KEY=${ALPHA_VANTAGE_API_KEY}
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    volumes:
+      - ${GCS_CREDENTIALS_PATH}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+      - model_cache:/app/model_cache  # Local model cache
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - breakout_network
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dedicated Training Service - GPU only when needed
+  training-service:
+    build: 
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: breakout-system:gpu
+    command: python -m project.training_service  # Dedicated training service
+    environment:
+      - FLASK_ENV=production
+      - TRAINING_SERVICE_ENABLED=true
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - TRAINING_SCHEDULE=0 2 * * *  # Train at 2 AM daily
+    volumes:
+      - ${GCS_CREDENTIALS_PATH}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+      - training_data:/app/training_data
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - breakout_network
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - training  # Only run when training profile is active
+
+  # Regular Celery Workers - CPU tasks
+  celery-worker:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: celery -A project.extensions:celery worker --loglevel=info --queues=breakout_analysis,market_screening --concurrency=4
+    environment:
+      - FLASK_ENV=production
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - USE_GPU_FOR_INFERENCE=false
+    volumes:
+      - ${GCS_CREDENTIALS_PATH}:/app/credentials/gcs-key.json:ro
+      - ./logs:/app/logs
+      - model_cache:/app/model_cache:ro  # Read-only access to cached models
+    depends_on:
+      - redis
+    networks:
+      - breakout_network
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build: 
+      context: .
+      dockerfile: Dockerfile.production
+    image: breakout-system:latest
+    command: celery -A project.extensions:celery beat --loglevel=info
+    environment:
+      - FLASK_ENV=production
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+    volumes:
+      - ./logs:/app/logs
+      - celerybeat_schedule:/app/celerybeat
+    depends_on:
+      - redis
+    networks:
+      - breakout_network
+
+  # Redis with optimized configuration
+  redis:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - breakout_network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  # PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=breakout_system
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_SHARED_BUFFERS=256MB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=1GB
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_scripts:/docker-entrypoint-initdb.d
+    networks:
+      - breakout_network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+
+  # Monitoring stack
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - breakout_network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+    networks:
+      - breakout_network
+
+  # NGINX for production
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - static_files:/usr/share/nginx/html/static:ro
+    depends_on:
+      - web
+    networks:
+      - breakout_network
+
+networks:
+  breakout_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  model_cache:
+  training_data:
+  celerybeat_schedule:
+  static_files:
+
+# ---
+# Dockerfile.production (Optimized)
+FROM python:3.11-slim as builder
+
+# Build stage - compile dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels -r requirements.txt
+
+# Runtime stage
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN useradd --create-home --shell /bin/bash app
+
+WORKDIR /app
+
+# Copy wheels and install
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+# Copy application
+COPY --chown=app:app . .
+
+# Create directories
+RUN mkdir -p /app/logs /app/model_cache && \
+    chown -R app:app /app
+
+USER app
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:5000/api/health || exit 1
+
+CMD ["gunicorn", "--config", "gunicorn_config.py", "project.server:app"]
+
+# ---
+# project/training_service.py
+"""
+Dedicated training service that runs on-demand with GPU
+"""
+
+import asyncio
+import logging
+import schedule
+import time
+from datetime import datetime
+
+from .auto_optimizer_working import WorkingAutoOptimizer
+from .storage import get_gcs_storage
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+class TrainingService:
+    """Dedicated service for model training"""
+    
+    def __init__(self):
+        self.optimizer = WorkingAutoOptimizer()
+        self.is_training = False
+        
+    async def initialize(self):
+        """Initialize the training service"""
+        await self.optimizer.initialize()
+        logger.info("Training service initialized")
+        
+    async def run_training(self):
+        """Run a training cycle"""
+        if self.is_training:
+            logger.warning("Training already in progress")
+            return
+            
+        self.is_training = True
+        start_time = datetime.now()
+        
+        try:
+            logger.info("Starting scheduled training cycle")
+            
+            # Run optimization
+            await self.optimizer.run_optimization()
+            
+            # Save results
+            gcs = get_gcs_storage()
+            if gcs:
+                training_log = {
+                    'timestamp': start_time.isoformat(),
+                    'duration': (datetime.now() - start_time).total_seconds(),
+                    'status': 'success',
+                    'optimization_history': self.optimizer.optimization_history
+                }
+                
+                gcs.upload_json(
+                    training_log,
+                    f"training_logs/log_{start_time.strftime('%Y%m%d_%H%M%S')}.json"
+                )
+            
+            logger.info(f"Training completed in {(datetime.now() - start_time).total_seconds():.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+            
+        finally:
+            self.is_training = False
+            
+            # Free GPU memory
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
+    async def start(self):
+        """Start the training service"""
+        await self.initialize()
+        
+        # Schedule training
+        schedule_time = Config.TRAINING_SCHEDULE or "02:00"  # Default 2 AM
+        schedule.every().day.at(schedule_time).do(
+            lambda: asyncio.create_task(self.run_training())
+        )
+        
+        logger.info(f"Training scheduled daily at {schedule_time}")
+        
+        # Main loop
+        while True:
+            schedule.run_pending()
+            await asyncio.sleep(60)  # Check every minute
+
+async def main():
+    """Main entry point for training service"""
+    service = TrainingService()
+    await service.start()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+
+# ---
+# deployment/kubernetes/training-job.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: breakout-model-training
+  namespace: breakout-system
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: training
+            image: gcr.io/YOUR_PROJECT_ID/breakout-system:gpu
+            command: ["python", "-m", "project.training_service"]
+            env:
+            - name: TRAINING_MODE
+              value: "batch"
+            envFrom:
+            - secretRef:
+                name: breakout-secrets
+            volumeMounts:
+            - name: gcs-credentials
+              mountPath: /app/credentials
+              readOnly: true
+            resources:
+              limits:
+                nvidia.com/gpu: 1
+                memory: "16Gi"
+                cpu: "8"
+              requests:
+                nvidia.com/gpu: 1
+                memory: "8Gi"
+                cpu: "4"
+          volumes:
+          - name: gcs-credentials
+            secret:
+              secretName: gcs-credentials
+          restartPolicy: OnFailure
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-tesla-t4

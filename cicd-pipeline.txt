@@ -1,0 +1,392 @@
+name: ML Trading System CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * MON'  # Weekly security scan
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # 1. Code Quality & Security
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install black flake8 mypy bandit safety pylint
+      
+      - name: Black formatting check
+        run: black --check project/
+      
+      - name: Flake8 linting
+        run: flake8 project/ --max-line-length=120 --extend-ignore=E203,W503
+      
+      - name: Type checking with mypy
+        run: mypy project/ --ignore-missing-imports
+      
+      - name: Security audit with bandit
+        run: bandit -r project/ -f json -o bandit-report.json
+      
+      - name: Dependency vulnerability scan
+        run: |
+          safety check -r requirements.txt --json > safety-report.json
+          piprot requirements.txt || true
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+
+  # 2. Unit & Integration Tests
+  test-suite:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        test-type: [unit, integration, ml-validation]
+    
+    services:
+      redis:
+        image: redis:7.2-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio pytest-benchmark
+      
+      - name: Run ${{ matrix.test-type }} tests
+        env:
+          REDIS_URL: redis://localhost:6379
+          FLASK_ENV: testing
+        run: |
+          if [ "${{ matrix.test-type }}" == "unit" ]; then
+            pytest tests/unit/ -v --cov=project --cov-report=xml
+          elif [ "${{ matrix.test-type }}" == "integration" ]; then
+            pytest tests/integration/ -v --cov=project --cov-report=xml
+          elif [ "${{ matrix.test-type }}" == "ml-validation" ]; then
+            python -m tests.ml_validation.validate_models
+          fi
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: ${{ matrix.test-type }}
+          name: ${{ matrix.test-type }}-coverage
+
+  # 3. Model Performance Validation
+  model-validation:
+    runs-on: ubuntu-latest
+    needs: test-suite
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get full history for comparison
+      
+      - name: Set up Python with CUDA support
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install ML dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install mlflow dvc
+      
+      - name: Download test data from DVC
+        env:
+          DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
+        run: |
+          dvc remote modify origin url $DVC_REMOTE_URL
+          dvc pull data/test_datasets
+      
+      - name: Run model performance tests
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python scripts/validate_model_performance.py \
+            --baseline-branch main \
+            --current-branch ${{ github.head_ref }} \
+            --metrics-threshold 0.95
+      
+      - name: Generate performance report
+        run: |
+          python scripts/generate_performance_report.py \
+            --output performance-report.html
+      
+      - name: Comment PR with results
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('performance-report.html', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Model Performance Report\n\n${report}`
+            });
+
+  # 4. Build & Push Docker Images
+  build-images:
+    runs-on: ubuntu-latest
+    needs: [test-suite, model-validation]
+    if: github.event_name == 'push'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    strategy:
+      matrix:
+        service: [web, celery-worker, mlflow]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+
+  # 5. Deploy to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-images
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.trading-system.example.com
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Kubernetes CLI
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        env:
+          KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Update image tags in manifests
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" k8s/staging/*.yaml
+          
+          # Apply configurations
+          kubectl apply -f k8s/staging/namespace.yaml
+          kubectl apply -f k8s/staging/configmap.yaml
+          kubectl apply -f k8s/staging/secrets.yaml
+          kubectl apply -f k8s/staging/
+          
+          # Wait for rollout
+          kubectl rollout status deployment/trading-web -n staging --timeout=10m
+          kubectl rollout status deployment/trading-worker -n staging --timeout=10m
+      
+      - name: Run smoke tests
+        run: |
+          STAGING_URL=$(kubectl get ingress -n staging -o jsonpath='{.items[0].spec.rules[0].host}')
+          python scripts/smoke_tests.py --url https://$STAGING_URL
+
+  # 6. Canary Deployment to Production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://trading-system.example.com
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl for production
+        env:
+          KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+      
+      - name: Deploy canary (10% traffic)
+        run: |
+          # Deploy canary version
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" k8s/production/canary/*.yaml
+          kubectl apply -f k8s/production/canary/
+          
+          # Update traffic split
+          kubectl patch virtualservice trading-system -n production \
+            --type merge \
+            -p '{"spec":{"http":[{"match":[{"headers":{"canary":{"exact":"true"}}}],"route":[{"destination":{"host":"trading-web-canary"}}]},{"route":[{"destination":{"host":"trading-web","weight":90}},{"destination":{"host":"trading-web-canary","weight":10}}]}]}}'
+      
+      - name: Monitor canary metrics
+        run: |
+          python scripts/monitor_canary.py \
+            --duration 30 \
+            --error-threshold 0.01 \
+            --latency-p99-threshold 500
+      
+      - name: Promote to full production
+        if: success()
+        run: |
+          # Update main deployment
+          kubectl set image deployment/trading-web \
+            trading-web=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-web:${{ github.sha }} \
+            -n production
+          
+          kubectl set image deployment/trading-worker \
+            trading-worker=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-celery-worker:${{ github.sha }} \
+            -n production
+          
+          # Remove canary after successful promotion
+          kubectl delete -f k8s/production/canary/
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/trading-web -n production
+          kubectl rollout undo deployment/trading-worker -n production
+          kubectl delete -f k8s/production/canary/
+
+  # 7. Post-deployment validation
+  post-deployment:
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: success()
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run E2E tests
+        run: |
+          pip install playwright pytest-playwright
+          playwright install chromium
+          pytest tests/e2e/ -v --base-url=https://trading-system.example.com
+      
+      - name: Performance testing
+        run: |
+          pip install locust
+          locust -f tests/performance/locustfile.py \
+            --host=https://trading-system.example.com \
+            --users=100 \
+            --spawn-rate=10 \
+            --run-time=5m \
+            --headless \
+            --only-summary
+      
+      - name: Notify deployment success
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'Production deployment successful! Version: ${{ github.sha }}'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # 8. Scheduled dependency updates
+  dependency-update:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Update dependencies
+        run: |
+          pip install pipupgrade safety
+          pipupgrade --requirements requirements.txt --check
+          safety check -r requirements.txt
+      
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: 'chore: update dependencies'
+          title: 'Automated dependency updates'
+          body: |
+            ## Dependency Updates
+            
+            This PR contains automated dependency updates.
+            
+            Please review the changes and ensure all tests pass.
+          branch: automated-dependency-updates

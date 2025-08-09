@@ -1,296 +1,504 @@
-"""
-ENHANCED: training.py - Complete training module with all optimizations
-"""
-
+# project/training_optimized.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 import logging
 import traceback
-import joblib
-from pathlib import Path
+import copy
+import numpy as np
+import time
+import psutil
+import gc
+from typing import Dict, Tuple, Optional, Callable
+from dataclasses import dataclass
+from prometheus_client import Histogram, Counter, Gauge
 
-# Project imports
-from project.config import Config, get_device
-from project.features import prepare_sequences, get_feature_columns, _create_features, select_features
-from project.lstm_models import Seq2Seq, Encoder, Decoder, AsymmetricWeightedMSELoss
-from project.storage import update_model_registry, get_model_registry
-from project.web_setup import celery
-from project.monitoring import setup_mlflow, start_mlflow_run
+# Import from other project modules
+from .data_processing import data_quality_check
+from .features_optimized import OptimizedFeatureEngine, select_features
+from .models import Seq2Seq, Encoder, Decoder, get_device
+from .config import Config
 
 logger = logging.getLogger(__name__)
 
-def validate_training_data(df, selected_features):
-    """
-    Validate training data before model training
-    """
-    if df is None or len(df) == 0:
-        raise ValueError("Training data is empty")
-    
-    if len(df) < Config.DATA_WINDOW_SIZE + Config.DATA_PREDICTION_LENGTH:
-        raise ValueError(f"Insufficient data: need at least {Config.DATA_WINDOW_SIZE + Config.DATA_PREDICTION_LENGTH} rows")
-    
-    # Check for required columns
-    required_columns = ['open', 'high', 'low', 'close', 'volume']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {missing_columns}")
-    
-    # Check for excessive NaN values
-    nan_ratio = df.isnull().sum().sum() / (len(df) * len(df.columns))
-    if nan_ratio > 0.1:  # More than 10% NaN values
-        logger.warning(f"High NaN ratio in data: {nan_ratio:.2%}")
-    
-    logger.info(f"Data validation passed: {len(df)} rows, {len(df.columns)} columns")
+# Prometheus metrics for training monitoring
+TRAINING_DURATION = Histogram('ml_training_duration_seconds', 
+                             'Training duration', ['model_type', 'ticker'])
+TRAINING_MEMORY_PEAK = Gauge('ml_training_memory_peak_mb', 
+                            'Peak memory usage during training', ['model_type'])
+TRAINING_LOSS = Gauge('ml_training_final_loss', 
+                     'Final training loss', ['model_type', 'ticker'])
+BATCH_PROCESSING_TIME = Histogram('ml_batch_processing_seconds',
+                                 'Time to process one batch', ['model_type'])
 
-def build_and_train_lstm(df, selected_features, hparams, validation_split=0.2, update_callback=None):
-    """
-    ENHANCED: Build and train LSTM model with comprehensive error handling
+@dataclass
+class TrainingMetrics:
+    """Training metrics collection"""
+    train_losses: list
+    val_losses: list
+    epoch_times: list
+    memory_usage: list
+    batch_times: list
     
-    Args:
-        df: Training DataFrame
-        selected_features: List of selected feature columns
-        hparams: Hyperparameters dictionary
-        validation_split: Fraction of data for validation
-        update_callback: Optional callback for progress updates
-    
-    Returns:
-        dict: Training results with model, scaler, and metrics
+    def to_dict(self) -> Dict:
+        return {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'epoch_times': self.epoch_times,
+            'memory_usage': self.memory_usage,
+            'batch_times': self.batch_times,
+            'final_train_loss': self.train_losses[-1] if self.train_losses else 0,
+            'final_val_loss': self.val_losses[-1] if self.val_losses else 0,
+            'avg_epoch_time': np.mean(self.epoch_times) if self.epoch_times else 0,
+            'peak_memory_mb': max(self.memory_usage) if self.memory_usage else 0
+        }
+
+class MemoryEfficientDataLoader:
     """
-    try:
-        logger.info("Starting LSTM training...")
-        validate_training_data(df, selected_features)
+    OPTIMIZATION: Memory-efficient data loader for large datasets
+    Prevents OOM errors and optimizes GPU memory usage
+    """
+    
+    def __init__(self, src_data: np.ndarray, trg_data: np.ndarray, 
+                 batch_size: int = 32, shuffle: bool = True):
+        self.src_data = src_data
+        self.trg_data = trg_data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n_samples = len(src_data)
+        self.n_batches = (self.n_samples + batch_size - 1) // batch_size
         
-        # Prepare sequences
-        if validation_split > 0:
-            train_size = int(len(df) * (1 - validation_split))
-            train_df = df.iloc[:train_size]
-            val_df = df.iloc[train_size:]
+        if shuffle:
+            self.indices = np.random.permutation(self.n_samples)
         else:
-            train_df = df
-            val_df = None
+            self.indices = np.arange(self.n_samples)
+    
+    def __iter__(self):
+        for i in range(0, self.n_samples, self.batch_size):
+            end_idx = min(i + self.batch_size, self.n_samples)
+            batch_indices = self.indices[i:end_idx]
+            
+            batch_src = self.src_data[batch_indices]
+            batch_trg = self.trg_data[batch_indices]
+            
+            yield torch.tensor(batch_src, dtype=torch.float32), torch.tensor(batch_trg, dtype=torch.float32)
+    
+    def __len__(self):
+        return self.n_batches
+
+class OptimizedLSTMTrainer:
+    """
+    PERFORMANCE: Memory-efficient, GPU-optimized LSTM trainer
+    Features:
+    - Dynamic batch sizing based on available memory
+    - Gradient accumulation for large effective batch sizes
+    - Memory cleanup and monitoring
+    - Mixed precision training (optional)
+    """
+    
+    def __init__(self, model: nn.Module, device: torch.device, 
+                 use_mixed_precision: bool = False):
+        self.model = model
+        self.device = device
+        self.use_mixed_precision = use_mixed_precision
+        self.scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
         
-        src, trg, scaler = prepare_sequences(
-            train_df, 
-            Config.DATA_WINDOW_SIZE, 
-            Config.DATA_PREDICTION_LENGTH, 
-            selected_features
-        )
+        # Memory monitoring
+        self.memory_monitor = psutil.Process()
         
-        if src.shape[0] == 0:
-            raise ValueError("No training sequences generated")
+    def _get_optimal_batch_size(self, data_size: int, max_memory_gb: float = 4.0) -> int:
+        """
+        SMART: Dynamically calculate optimal batch size based on available memory
+        """
+        if torch.cuda.is_available():
+            # GPU memory calculation
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            available_memory = gpu_memory * 0.8  # Use 80% of GPU memory
+            
+            # Estimate memory per sample (rough approximation)
+            memory_per_sample = data_size * 4 * 8  # 4 bytes per float, 8x overhead
+            optimal_batch_size = int(available_memory / memory_per_sample)
+            
+            # Clamp to reasonable range
+            optimal_batch_size = max(8, min(optimal_batch_size, 128))
+        else:
+            # CPU memory calculation
+            available_memory = max_memory_gb * 1024 * 1024 * 1024  # Convert to bytes
+            memory_per_sample = data_size * 4 * 4  # Less overhead for CPU
+            optimal_batch_size = int(available_memory / memory_per_sample)
+            optimal_batch_size = max(16, min(optimal_batch_size, 64))
         
-        logger.info(f"Generated {src.shape[0]} training sequences")
+        logger.info(f"Optimal batch size calculated: {optimal_batch_size}")
+        return optimal_batch_size
+    
+    def _memory_cleanup(self):
+        """Aggressive memory cleanup"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def _get_memory_usage_mb(self) -> float:
+        """Get current memory usage in MB"""
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / 1024 / 1024
+        else:
+            return self.memory_monitor.memory_info().rss / 1024 / 1024
+    
+    def train_epoch(self, data_loader: MemoryEfficientDataLoader, 
+                   optimizer: torch.optim.Optimizer, 
+                   criterion: nn.Module,
+                   teacher_forcing_ratio: float = 0.5,
+                   gradient_accumulation_steps: int = 1) -> Tuple[float, float]:
+        """
+        OPTIMIZED: Memory-efficient epoch training with monitoring
+        """
+        self.model.train()
+        total_loss = 0.0
+        batch_count = 0
+        memory_peak = 0.0
         
-        # Validation sequences
-        val_src, val_trg = None, None
-        if val_df is not None and len(val_df) > Config.DATA_WINDOW_SIZE:
-            val_src, val_trg, _ = prepare_sequences(
-                val_df, 
-                Config.DATA_WINDOW_SIZE, 
-                Config.DATA_PREDICTION_LENGTH, 
-                selected_features, 
-                scaler=scaler
-            )
-            logger.info(f"Generated {val_src.shape[0] if val_src is not None else 0} validation sequences")
+        optimizer.zero_grad()
         
-        # Model setup
+        for batch_idx, (batch_src, batch_trg) in enumerate(data_loader):
+            batch_start_time = time.time()
+            
+            # Move to device
+            batch_src = batch_src.to(self.device, non_blocking=True)
+            batch_trg = batch_trg.to(self.device, non_blocking=True)
+            
+            # Forward pass with optional mixed precision
+            if self.use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    output = self.model(batch_src, batch_trg, teacher_forcing_ratio)
+                    loss = criterion(output, batch_trg)
+                    loss = loss / gradient_accumulation_steps
+                
+                # Backward pass with gradient scaling
+                self.scaler.scale(loss).backward()
+                
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                    optimizer.zero_grad()
+            else:
+                # Standard precision training
+                output = self.model(batch_src, batch_trg, teacher_forcing_ratio)
+                loss = criterion(output, batch_trg)
+                loss = loss / gradient_accumulation_steps
+                
+                loss.backward()
+                
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+            
+            total_loss += loss.item() * gradient_accumulation_steps
+            batch_count += 1
+            
+            # Memory monitoring
+            current_memory = self._get_memory_usage_mb()
+            memory_peak = max(memory_peak, current_memory)
+            
+            # Batch timing
+            batch_time = time.time() - batch_start_time
+            BATCH_PROCESSING_TIME.labels(model_type='lstm').observe(batch_time)
+            
+            # Memory cleanup every 10 batches
+            if batch_idx % 10 == 0:
+                self._memory_cleanup()
+            
+            # Progress logging for large datasets
+            if batch_idx % 50 == 0:
+                logger.debug(f"Batch {batch_idx}/{len(data_loader)}, "
+                           f"Loss: {loss.item():.6f}, "
+                           f"Memory: {current_memory:.1f}MB")
+        
+        avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+        
+        # Update metrics
+        TRAINING_MEMORY_PEAK.labels(model_type='lstm').set(memory_peak)
+        
+        return avg_loss, memory_peak
+    
+    def validate_epoch(self, data_loader: MemoryEfficientDataLoader, 
+                      criterion: nn.Module) -> float:
+        """
+        OPTIMIZED: Memory-efficient validation
+        """
+        self.model.eval()
+        total_loss = 0.0
+        batch_count = 0
+        
+        with torch.no_grad():
+            for batch_src, batch_trg in data_loader:
+                batch_src = batch_src.to(self.device, non_blocking=True)
+                batch_trg = batch_trg.to(self.device, non_blocking=True)
+                
+                if self.use_mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        output = self.model(batch_src, batch_trg, teacher_forcing_ratio=0.0)
+                        loss = criterion(output, batch_trg)
+                else:
+                    output = self.model(batch_src, batch_trg, teacher_forcing_ratio=0.0)
+                    loss = criterion(output, batch_trg)
+                
+                total_loss += loss.item()
+                batch_count += 1
+        
+        avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+        return avg_loss
+
+def build_and_train_lstm_optimized(df, selected_features, hparams, validation_split=0.2,
+                                 progress_callback: Optional[Callable] = None) -> Dict:
+    """
+    MAIN OPTIMIZATION: Memory-efficient LSTM training with comprehensive monitoring
+    Features:
+    - Dynamic batch sizing
+    - Memory monitoring and cleanup
+    - Mixed precision training
+    - Gradient accumulation
+    - Comprehensive metrics collection
+    """
+    training_start_time = time.time()
+    ticker = hparams.get('ticker', 'unknown')
+    
+    try:
+        # Initialize feature engine
+        feature_engine = OptimizedFeatureEngine()
+        
+        # Data quality check
+        data_quality_check(df)
+        
+        # Progress update
+        if progress_callback:
+            progress_callback(10, "Preparing data and features...")
+        
+        # Train/validation split
+        train_df, val_df = train_test_split(df, test_size=validation_split, shuffle=False)
+        
+        # Feature preparation with optimized engine
+        from .features_optimized import prepare_sequences
+        src, trg, scaler = prepare_sequences(train_df, Config.DATA_WINDOW_SIZE, 
+                                           Config.DATA_PREDICTION_LENGTH, selected_features)
+        
+        if validation_split > 0:
+            val_src, val_trg, _ = prepare_sequences(val_df, Config.DATA_WINDOW_SIZE, 
+                                                  Config.DATA_PREDICTION_LENGTH, 
+                                                  selected_features, scaler=scaler)
+        else:
+            val_src, val_trg = np.array([]), np.array([])
+        
+        if len(src) == 0:
+            raise ValueError("Not enough data to create training sequences.")
+        
+        if progress_callback:
+            progress_callback(25, f"Created {len(src)} training sequences...")
+        
+        # Device setup
         device = get_device()
-        input_dim = src.shape[-1]
+        use_mixed_precision = torch.cuda.is_available() and hparams.get('use_mixed_precision', True)
         
-        # Use hyperparameters with fallbacks
-        hidden_dim = hparams.get('hidden_dim', 128)
-        n_layers = hparams.get('n_layers', 2)
-        dropout_prob = hparams.get('dropout_prob', 0.2)
-        learning_rate = hparams.get('learning_rate', 1e-3)
-        epochs = hparams.get('epochs', 50)
+        # Model initialization
+        model = Seq2Seq(
+            Encoder(src.shape[-1], hparams['hidden_dim'], hparams['n_layers'], hparams['dropout_prob']),
+            Decoder(src.shape[-1], hparams['hidden_dim'], hparams['n_layers'], hparams['dropout_prob']),
+            device
+        ).to(device)
         
-        encoder = Encoder(input_dim, hidden_dim, n_layers, dropout_prob).to(device)
-        decoder = Decoder(input_dim, hidden_dim, n_layers, dropout_prob).to(device)
-        model = Seq2Seq(encoder, decoder, device).to(device)
+        # Optimizer with weight decay
+        optimizer = optim.AdamW(
+            model.parameters(), 
+            lr=hparams['learning_rate'], 
+            weight_decay=hparams.get('weight_decay', 1e-5),
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
         
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        # Learning rate scheduler
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
         
-        # Loss function setup
-        criterion = AsymmetricWeightedMSELoss()
+        criterion = nn.MSELoss()
         
-        # Prepare tensors
-        src_tensor = torch.tensor(src, dtype=torch.float32).to(device)
-        trg_tensor = torch.tensor(trg, dtype=torch.float32).to(device)
+        # Initialize trainer
+        trainer = OptimizedLSTMTrainer(model, device, use_mixed_precision)
         
-        # Calculate boundaries for asymmetric loss
-        close_idx = selected_features.index('close') if 'close' in selected_features else 0
-        last_known_close = src_tensor[:, -1, close_idx]
-        
-        historical_volatility = torch.clamp(
-            src_tensor[:, :, close_idx].std(dim=1),
-            min=Config.MIN_VOLATILITY,
-            max=last_known_close * 0.5  # Cap at 50% of price
+        # Dynamic batch size calculation
+        optimal_batch_size = trainer._get_optimal_batch_size(
+            src.shape[1] * src.shape[2], 
+            max_memory_gb=hparams.get('max_memory_gb', 6.0)
         )
+        batch_size = min(hparams.get('batch_size', optimal_batch_size), optimal_batch_size)
         
-        upper_bound_val = last_known_close + (Config.ATR_MULTIPLIER * historical_volatility)
-        lower_bound_val = last_known_close - (Config.ATR_MULTIPLIER * historical_volatility)
+        # Create data loaders
+        train_loader = MemoryEfficientDataLoader(src, trg, batch_size=batch_size, shuffle=True)
         
-        upper_bound = upper_bound_val.unsqueeze(1).unsqueeze(2).expand(-1, trg.shape[1], src.shape[2])
-        lower_bound = lower_bound_val.unsqueeze(1).unsqueeze(2).expand(-1, trg.shape[1], src.shape[2])
+        val_loader = None
+        if len(val_src) > 0:
+            val_loader = MemoryEfficientDataLoader(val_src, val_trg, batch_size=batch_size, shuffle=False)
         
-        # Validation tensors
-        val_src_tensor, val_trg_tensor = None, None
-        val_upper_bound, val_lower_bound = None, None
+        if progress_callback:
+            progress_callback(40, f"Starting training with batch size {batch_size}...")
         
-        if val_src is not None:
-            val_src_tensor = torch.tensor(val_src, dtype=torch.float32).to(device)
-            val_trg_tensor = torch.tensor(val_trg, dtype=torch.float32).to(device)
-            
-            val_last_close = val_src_tensor[:, -1, close_idx]
-            val_volatility = torch.clamp(
-                val_src_tensor[:, :, close_idx].std(dim=1),
-                min=Config.MIN_VOLATILITY,
-                max=val_last_close * 0.5
-            )
-            
-            val_upper_val = val_last_close + (Config.ATR_MULTIPLIER * val_volatility)
-            val_lower_val = val_last_close - (Config.ATR_MULTIPLIER * val_volatility)
-            
-            val_upper_bound = val_upper_val.unsqueeze(1).unsqueeze(2).expand(-1, val_trg.shape[1], val_src.shape[2])
-            val_lower_bound = val_lower_val.unsqueeze(1).unsqueeze(2).expand(-1, val_trg.shape[1], val_src.shape[2])
+        # Training metrics
+        metrics = TrainingMetrics([], [], [], [], [])
         
-        # Training loop
-        train_losses = []
-        val_losses = []
+        # Early stopping
         best_val_loss = float('inf')
         patience_counter = 0
-        patience = 15
+        best_model_state = None
         
-        logger.info(f"Starting training for {epochs} epochs...")
+        # Gradient accumulation steps for effective larger batch size
+        gradient_accumulation_steps = max(1, hparams.get('effective_batch_size', 64) // batch_size)
         
-        for epoch in range(epochs):
+        logger.info(f"Training LSTM: {hparams['epochs']} epochs, batch_size={batch_size}, "
+                   f"gradient_accumulation={gradient_accumulation_steps}, "
+                   f"mixed_precision={use_mixed_precision}")
+        
+        # Training loop
+        for epoch in range(hparams['epochs']):
+            epoch_start_time = time.time()
+            
             # Training phase
-            model.train()
-            optimizer.zero_grad()
-            
-            output = model(src_tensor, trg_tensor)
-            train_loss = criterion(output, trg_tensor, upper_bound, lower_bound)
-            
-            # Check for NaN
-            if torch.isnan(train_loss):
-                logger.error("NaN loss detected during training")
-                raise ValueError("Training produced NaN loss")
-            
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            train_losses.append(train_loss.item())
+            train_loss, memory_peak = trainer.train_epoch(
+                train_loader, optimizer, criterion,
+                teacher_forcing_ratio=hparams.get('teacher_forcing_ratio', 0.5),
+                gradient_accumulation_steps=gradient_accumulation_steps
+            )
             
             # Validation phase
-            val_loss = None
-            if val_src_tensor is not None:
-                model.eval()
-                with torch.no_grad():
-                    val_output = model(val_src_tensor, val_trg_tensor, teacher_forcing_ratio=0.0)
-                    val_loss = criterion(val_output, val_trg_tensor, val_upper_bound, val_lower_bound)
-                    val_losses.append(val_loss.item())
-                    
-                    # Early stopping
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        patience_counter = 0
-                        # Save best model state
-                        best_model_state = model.state_dict().copy()
-                    else:
-                        patience_counter += 1
-                    
-                    scheduler.step(val_loss)
-                    
-                    if patience_counter >= patience:
-                        logger.info(f"Early stopping at epoch {epoch + 1}")
-                        model.load_state_dict(best_model_state)
-                        break
-            else:
-                scheduler.step(train_loss)
+            val_loss = float('inf')
+            if val_loader is not None:
+                val_loss = trainer.validate_epoch(val_loader, criterion)
+                scheduler.step(val_loss)
             
-            # Progress callback
-            if update_callback and epoch % 10 == 0:
-                progress = (epoch + 1) / epochs
-                update_callback(f"Training LSTM: Epoch {epoch + 1}/{epochs}", progress)
+            # Record metrics
+            epoch_time = time.time() - epoch_start_time
+            memory_usage = trainer._get_memory_usage_mb()
+            
+            metrics.train_losses.append(train_loss)
+            metrics.val_losses.append(val_loss)
+            metrics.epoch_times.append(epoch_time)
+            metrics.memory_usage.append(memory_usage)
+            
+            # Progress update
+            if progress_callback:
+                progress = 40 + int((epoch + 1) / hparams['epochs'] * 50)
+                progress_callback(progress, 
+                    f"Epoch {epoch+1}/{hparams['epochs']}: Train Loss: {train_loss:.6f}, "
+                    f"Val Loss: {val_loss:.6f}")
             
             # Logging
-            if (epoch + 1) % 10 == 0:
-                if val_loss is not None:
-                    logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss.item():.6f}, "
-                              f"Val Loss: {val_loss.item():.6f}")
-                else:
-                    logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss.item():.6f}")
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                logger.info(f"LSTM Epoch {epoch+1}/{hparams['epochs']}: "
+                           f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, "
+                           f"Time: {epoch_time:.2f}s, Memory: {memory_usage:.1f}MB")
+            
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                break
+            
+            # Memory cleanup every few epochs
+            if epoch % 5 == 0:
+                trainer._memory_cleanup()
         
-        # Final evaluation
-        model.eval()
-        final_train_loss = train_losses[-1] if train_losses else float('inf')
-        final_val_loss = val_losses[-1] if val_losses else None
+        # Load best model
+        if best_model_state:
+            model.load_state_dict(best_model_state)
         
-        logger.info(f"LSTM training completed - Final train loss: {final_train_loss:.6f}")
-        if final_val_loss is not None:
-            logger.info(f"Final validation loss: {final_val_loss:.6f}")
+        # Final cleanup
+        trainer._memory_cleanup()
         
-        return {
+        # Record final metrics
+        training_time = time.time() - training_start_time
+        final_metrics = metrics.to_dict()
+        
+        # Prometheus metrics
+        TRAINING_DURATION.labels(model_type='lstm', ticker=ticker).observe(training_time)
+        TRAINING_LOSS.labels(model_type='lstm', ticker=ticker).set(best_val_loss)
+        
+        if progress_callback:
+            progress_callback(95, "Training completed, preparing results...")
+        
+        result = {
             'model': model,
             'scaler': scaler,
-            'train_loss': final_train_loss,
-            'val_loss': final_val_loss,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'epochs_trained': len(train_losses),
-            'hyperparameters': hparams
+            'train_loss': final_metrics['final_train_loss'],
+            'val_loss': best_val_loss,
+            'training_time': training_time,
+            'metrics': final_metrics,
+            'hyperparameters': hparams,
+            'batch_size_used': batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+            'mixed_precision_used': use_mixed_precision
         }
         
+        logger.info(f"LSTM training completed: {training_time:.2f}s, "
+                   f"Best Val Loss: {best_val_loss:.6f}, "
+                   f"Peak Memory: {max(metrics.memory_usage):.1f}MB")
+        
+        return result
+        
     except Exception as e:
-        logger.error(f"LSTM training failed: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"LSTM training failed: {e}\n{traceback.format_exc()}")
+        # Record failure metrics
+        TRAINING_DURATION.labels(model_type='lstm', ticker=ticker).observe(time.time() - training_start_time)
         raise
 
-def build_and_train_xgboost(df, hparams, validation_split=0.2):
+def build_and_train_xgboost_optimized(df, hparams, validation_split=0.2,
+                                    progress_callback: Optional[Callable] = None) -> Dict:
     """
-    ENHANCED: Build and train XGBoost model with comprehensive error handling
-    
-    Args:
-        df: Training DataFrame
-        hparams: Hyperparameters dictionary
-        validation_split: Fraction of data for validation
-    
-    Returns:
-        dict: Training results with model and metrics
+    OPTIMIZED: XGBoost training with feature caching and monitoring
     """
+    training_start_time = time.time()
+    ticker = hparams.get('ticker', 'unknown')
+    
     try:
-        logger.info("Starting XGBoost training...")
-        validate_training_data(df, get_feature_columns())
+        if progress_callback:
+            progress_callback(10, "Preparing XGBoost data...")
         
-        # Feature engineering
-        df_with_features = _create_features(df.copy())
+        # Data quality check
+        data_quality_check(df)
+        
+        # Initialize feature engine
+        feature_engine = OptimizedFeatureEngine()
+        
+        # Create features using optimized engine
+        df_with_features = feature_engine.create_features_optimized(df.copy())
         df_with_features['target'] = df_with_features['close'].shift(-1)
         df_with_features.dropna(inplace=True)
         
-        if len(df_with_features) < 100:
-            raise ValueError("Insufficient data after feature engineering")
+        if df_with_features.empty:
+            raise ValueError("No data left after feature creation.")
         
-        # Prepare features and target
-        feature_columns = get_feature_columns()
-        available_features = [col for col in feature_columns if col in df_with_features.columns]
+        # Feature selection
+        selected_features = select_features(df_with_features, max_features=20)
+        logger.info(f"XGBoost using {len(selected_features)} features")
         
-        if len(available_features) < len(feature_columns) * 0.8:
-            logger.warning(f"Many features missing: {len(available_features)}/{len(feature_columns)} available")
+        if progress_callback:
+            progress_callback(30, f"Selected {len(selected_features)} features...")
         
-        X = df_with_features[available_features]
+        # Prepare training data
+        X = df_with_features[selected_features]
         y = df_with_features['target']
-        
-        logger.info(f"Training XGBoost with {len(available_features)} features on {len(X)} samples")
         
         # Train/validation split
         if validation_split > 0:
@@ -301,467 +509,257 @@ def build_and_train_xgboost(df, hparams, validation_split=0.2):
             X_train, y_train = X, y
             X_val, y_val = None, None
         
-        # Sample weighting for asymmetric loss
-        close_values = X_train['close'] if 'close' in X_train.columns else y_train
-        volatility = close_values.rolling(window=min(14, len(close_values)//4)).std()
-        volatility = volatility.fillna(volatility.mean()).fillna(Config.MIN_VOLATILITY)
+        if progress_callback:
+            progress_callback(50, "Training XGBoost model...")
         
-        upper_bound = close_values + (Config.ATR_MULTIPLIER * volatility)
-        lower_bound = close_values - (Config.ATR_MULTIPLIER * volatility)
-        
-        # Calculate sample weights
-        weights = np.ones_like(y_train)
-        above_upper = (y_train > upper_bound)
-        below_lower = (y_train < lower_bound)
-        weights[above_upper | below_lower] = Config.ATR_MULTIPLIER
-        
-        logger.info(f"Applied asymmetric weighting to {np.sum(above_upper | below_lower)} samples")
-        
-        # Model setup with hyperparameters
-        model_params = {
-            'n_estimators': hparams.get('n_estimators', 100),
-            'learning_rate': hparams.get('learning_rate', 0.1),
-            'max_depth': hparams.get('max_depth', 6),
-            'subsample': hparams.get('subsample', 0.8),
-            'colsample_bytree': hparams.get('colsample_bytree', 0.8),
-            'gamma': hparams.get('gamma', 0),
-            'min_child_weight': hparams.get('min_child_weight', 1),
-            'reg_alpha': hparams.get('reg_alpha', 0),
-            'reg_lambda': hparams.get('reg_lambda', 1),
-            'objective': hparams.get('objective', 'reg:squarederror'),
-            'device': hparams.get('device', Config.XGBOOST_HPARAMS.get('device', 'cpu')),
-            'random_state': 42,
-            'n_jobs': -1
+        # Enhanced hyperparameters with optimization
+        optimized_hparams = {
+            **hparams,
+            'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist',
+            'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor',
+            'enable_categorical': True,
+            'max_cat_to_onehot': 4,
+            'verbosity': 0
         }
         
-        model = xgb.XGBRegressor(**model_params)
+        # Model training with monitoring
+        model = xgb.XGBRegressor(**optimized_hparams)
         
-        # Training with evaluation
+        # Training with early stopping if validation data available
         eval_set = [(X_val, y_val)] if X_val is not None else None
+        
+        start_training_time = time.time()
         
         model.fit(
             X_train, y_train,
-            sample_weight=weights,
             eval_set=eval_set,
-            early_stopping_rounds=20 if eval_set else None,
+            early_stopping_rounds=10 if eval_set else None,
             verbose=False
         )
         
-        # Evaluation
-        train_preds = model.predict(X_train)
-        train_mse = mean_squared_error(y_train, train_preds)
-        train_mae = mean_absolute_error(y_train, train_preds)
+        training_time = time.time() - start_training_time
         
-        val_mse, val_mae = None, None
-        if X_val is not None:
-            val_preds = model.predict(X_val)
-            val_mse = mean_squared_error(y_val, val_preds)
-            val_mae = mean_absolute_error(y_val, val_preds)
+        if progress_callback:
+            progress_callback(80, "Analyzing feature importance...")
         
-        # Feature importance
-        feature_importance = dict(zip(available_features, model.feature_importances_))
-        top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:10]
+        # Feature importance analysis
+        feature_importance = {}
+        try:
+            importance_scores = model.get_booster().get_score(importance_type='weight')
+            # Map feature indices back to names
+            for i, feature in enumerate(selected_features):
+                feature_key = f'f{i}'
+                if feature_key in importance_scores:
+                    feature_importance[feature] = importance_scores[feature_key]
+                else:
+                    feature_importance[feature] = 0.0
+        except Exception as e:
+            logger.warning(f"Could not extract feature importance: {e}")
+            feature_importance = {f: 0.0 for f in selected_features}
         
-        logger.info(f"XGBoost training completed - Train MSE: {train_mse:.6f}")
-        if val_mse is not None:
-            logger.info(f"Validation MSE: {val_mse:.6f}")
+        # Model evaluation
+        train_score = model.score(X_train, y_train)
+        val_score = model.score(X_val, y_val) if X_val is not None else train_score
         
-        logger.info("Top 5 important features:")
-        for feature, importance in top_features[:5]:
-            logger.info(f"  {feature}: {importance:.4f}")
+        total_training_time = time.time() - training_start_time
         
-        return {
+        # Prometheus metrics
+        TRAINING_DURATION.labels(model_type='xgboost', ticker=ticker).observe(total_training_time)
+        TRAINING_LOSS.labels(model_type='xgboost', ticker=ticker).set(-val_score)  # Negative because higher score is better
+        
+        if progress_callback:
+            progress_callback(95, "XGBoost training completed...")
+        
+        result = {
             'model': model,
-            'train_score': -train_mse,  # Negative for consistency with sklearn convention
-            'val_score': -val_mse if val_mse is not None else None,
-            'train_mse': train_mse,
-            'train_mae': train_mae,
-            'val_mse': val_mse,
-            'val_mae': val_mae,
+            'train_score': train_score,
+            'val_score': val_score,
             'feature_importance': feature_importance,
-            'top_features': top_features,
-            'hyperparameters': hparams,
-            'available_features': available_features
+            'selected_features': selected_features,
+            'training_time': total_training_time,
+            'hyperparameters': optimized_hparams,
+            'n_estimators': model.n_estimators,
+            'best_iteration': getattr(model, 'best_iteration', model.n_estimators)
         }
         
-    except Exception as e:
-        logger.error(f"XGBoost training failed: {e}")
-        logger.error(traceback.format_exc())
-        raise
-
-@celery.task(bind=True)
-def train_lstm_async(self, df_json, hparams, ticker, selected_features):
-    """
-    ENHANCED: Async LSTM training with comprehensive error handling and model saving
-    """
-    try:
-        logger.info(f"Starting async LSTM training for {ticker}")
-        
-        # Load and validate data
-        df = pd.read_json(df_json)
-        validate_training_data(df, selected_features)
-        
-        # Start MLflow run for tracking
-        with start_mlflow_run(f"lstm_training_{ticker}"):
-            # Train model
-            result = build_and_train_lstm(
-                df=df,
-                selected_features=selected_features,
-                hparams=hparams,
-                validation_split=0.2,
-                update_callback=lambda msg, progress: self.update_state(
-                    state='PROGRESS',
-                    meta={'message': msg, 'progress': progress}
-                )
-            )
-            
-            # Save model and scaler
-            model_dir = Path(Config.MODEL_SAVE_PATH) / ticker
-            model_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save PyTorch model
-            torch.save(result['model'].state_dict(), model_dir / 'lstm_model.pth')
-            
-            # Save scaler
-            joblib.dump(result['scaler'], model_dir / 'scaler.pkl')
-            
-            # Save metadata
-            metadata = {
-                'model_type': 'lstm',
-                'ticker': ticker,
-                'selected_features': selected_features,
-                'hyperparameters': result['hyperparameters'],
-                'train_loss': result['train_loss'],
-                'val_loss': result['val_loss'],
-                'epochs_trained': result['epochs_trained'],
-                'input_dim': len(selected_features),
-                'timestamp': pd.Timestamp.now().isoformat()
-            }
-            
-            import json
-            with open(model_dir / 'lstm_metadata.json', 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            # Update model registry
-            update_model_registry(
-                ticker=ticker,
-                model_type="lstm_trained",
-                model_path=str(model_dir / 'lstm_model.pth'),
-                hparams=metadata
-            )
-            
-            logger.info(f"LSTM model saved for {ticker} at {model_dir}")
-            
-            return {
-                'status': 'SUCCESS',
-                'ticker': ticker,
-                'model_path': str(model_dir),
-                'train_loss': result['train_loss'],
-                'val_loss': result['val_loss'],
-                'epochs_trained': result['epochs_trained']
-            }
-    
-    except Exception as e:
-        logger.error(f"Async LSTM training failed for {ticker}: {e}")
-        logger.error(traceback.format_exc())
-        return {
-            'status': 'FAILED',
-            'ticker': ticker,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-@celery.task(bind=True)
-def train_xgboost_async(self, df_json, hparams, ticker):
-    """
-    ENHANCED: Async XGBoost training with comprehensive error handling and model saving
-    """
-    try:
-        logger.info(f"Starting async XGBoost training for {ticker}")
-        
-        # Load and validate data
-        df = pd.read_json(df_json)
-        validate_training_data(df, get_feature_columns())
-        
-        # Start MLflow run for tracking
-        with start_mlflow_run(f"xgboost_training_{ticker}"):
-            # Train model
-            result = build_and_train_xgboost(
-                df=df,
-                hparams=hparams,
-                validation_split=0.2
-            )
-            
-            # Save model
-            model_dir = Path(Config.MODEL_SAVE_PATH) / ticker
-            model_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save XGBoost model
-            result['model'].save_model(str(model_dir / 'xgboost_model.json'))
-            
-            # Alternative pickle save for compatibility
-            joblib.dump(result['model'], model_dir / 'xgboost_model.pkl')
-            
-            # Save metadata
-            metadata = {
-                'model_type': 'xgboost',
-                'ticker': ticker,
-                'hyperparameters': result['hyperparameters'],
-                'train_mse': result['train_mse'],
-                'val_mse': result['val_mse'],
-                'feature_importance': result['feature_importance'],
-                'top_features': result['top_features'],
-                'available_features': result['available_features'],
-                'timestamp': pd.Timestamp.now().isoformat()
-            }
-            
-            import json
-            with open(model_dir / 'xgboost_metadata.json', 'w') as f:
-                json.dump(metadata, f, indent=2, default=str)
-            
-            # Update model registry
-            update_model_registry(
-                ticker=ticker,
-                model_type="xgboost_trained",
-                model_path=str(model_dir / 'xgboost_model.pkl'),
-                hparams=metadata
-            )
-            
-            logger.info(f"XGBoost model saved for {ticker} at {model_dir}")
-            
-            return {
-                'status': 'SUCCESS',
-                'ticker': ticker,
-                'model_path': str(model_dir),
-                'train_mse': result['train_mse'],
-                'val_mse': result['val_mse'],
-                'feature_importance': result['top_features'][:5]
-            }
-    
-    except Exception as e:
-        logger.error(f"Async XGBoost training failed for {ticker}: {e}")
-        logger.error(traceback.format_exc())
-        return {
-            'status': 'FAILED',
-            'ticker': ticker,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-
-def load_trained_models(ticker):
-    """
-    Load trained models for a ticker from disk
-    
-    Args:
-        ticker: Stock ticker symbol
-    
-    Returns:
-        dict: Dictionary containing loaded models and metadata
-    """
-    try:
-        model_dir = Path(Config.MODEL_SAVE_PATH) / ticker
-        
-        if not model_dir.exists():
-            raise FileNotFoundError(f"No saved models found for {ticker}")
-        
-        result = {}
-        
-        # Load LSTM model if available
-        lstm_path = model_dir / 'lstm_model.pth'
-        scaler_path = model_dir / 'scaler.pkl'
-        lstm_meta_path = model_dir / 'lstm_metadata.json'
-        
-        if lstm_path.exists() and scaler_path.exists() and lstm_meta_path.exists():
-            # Load metadata first
-            import json
-            with open(lstm_meta_path, 'r') as f:
-                lstm_metadata = json.load(f)
-            
-            # Reconstruct model architecture
-            input_dim = lstm_metadata['input_dim']
-            hparams = lstm_metadata['hyperparameters']
-            
-            encoder = Encoder(
-                input_dim,
-                hparams.get('hidden_dim', 128),
-                hparams.get('n_layers', 2),
-                hparams.get('dropout_prob', 0.2)
-            )
-            
-            decoder = Decoder(
-                input_dim,
-                hparams.get('hidden_dim', 128),
-                hparams.get('n_layers', 2),
-                hparams.get('dropout_prob', 0.2)
-            )
-            
-            device = get_device()
-            lstm_model = Seq2Seq(encoder, decoder, device)
-            lstm_model.load_state_dict(torch.load(lstm_path, map_location=device))
-            lstm_model.eval()
-            
-            # Load scaler
-            scaler = joblib.load(scaler_path)
-            
-            result['lstm'] = {
-                'model': lstm_model,
-                'scaler': scaler,
-                'metadata': lstm_metadata
-            }
-            
-            logger.info(f"Loaded LSTM model for {ticker}")
-        
-        # Load XGBoost model if available
-        xgb_path = model_dir / 'xgboost_model.pkl'
-        xgb_meta_path = model_dir / 'xgboost_metadata.json'
-        
-        if xgb_path.exists() and xgb_meta_path.exists():
-            # Load model and metadata
-            xgb_model = joblib.load(xgb_path)
-            
-            import json
-            with open(xgb_meta_path, 'r') as f:
-                xgb_metadata = json.load(f)
-            
-            result['xgboost'] = {
-                'model': xgb_model,
-                'metadata': xgb_metadata
-            }
-            
-            logger.info(f"Loaded XGBoost model for {ticker}")
-        
-        if not result:
-            raise FileNotFoundError(f"No valid models found for {ticker}")
+        logger.info(f"XGBoost training completed: {total_training_time:.2f}s, "
+                   f"Train Score: {train_score:.4f}, Val Score: {val_score:.4f}")
         
         return result
         
     except Exception as e:
-        logger.error(f"Failed to load models for {ticker}: {e}")
+        logger.error(f"XGBoost training failed: {e}\n{traceback.format_exc()}")
+        # Record failure metrics
+        TRAINING_DURATION.labels(model_type='xgboost', ticker=ticker).observe(time.time() - training_start_time)
         raise
 
-def get_training_status(ticker):
+class TrainingManager:
     """
-    Get the current training status for a ticker
-    
-    Args:
-        ticker: Stock ticker symbol
-    
-    Returns:
-        dict: Training status information
+    ORCHESTRATION: Manages training workflows with monitoring and optimization
     """
-    try:
-        registry = get_model_registry()
-        
-        if ticker not in registry:
-            return {'status': 'NO_MODELS', 'message': f'No training history for {ticker}'}
-        
-        ticker_data = registry[ticker]
-        
-        status = {
-            'ticker': ticker,
-            'lstm_trained': 'lstm_trained' in ticker_data,
-            'xgboost_trained': 'xgboost_trained' in ticker_data,
-            'feature_selection': 'feature_selection' in ticker_data,
-            'last_updated': None
+    
+    def __init__(self):
+        self.active_trainings = {}
+        self.training_history = []
+    
+    def train_model_optimized(self, df, model_type: str, selected_features: list,
+                            hparams: dict, validation_split: float = 0.2,
+                            progress_callback: Optional[Callable] = None) -> Dict:
+        """
+        Main training orchestrator with automatic optimization
+        """
+        training_id = f"{model_type}_{int(time.time())}"
+        self.active_trainings[training_id] = {
+            'start_time': time.time(),
+            'model_type': model_type,
+            'status': 'starting'
         }
         
-        # Get timestamps if available
-        timestamps = []
-        for model_type in ['lstm_trained', 'xgboost_trained']:
-            if model_type in ticker_data:
-                model_data = ticker_data[model_type]
-                if isinstance(model_data, dict) and 'hparams' in model_data:
-                    timestamp = model_data['hparams'].get('timestamp')
-                    if timestamp:
-                        timestamps.append(pd.Timestamp(timestamp))
-        
-        if timestamps:
-            status['last_updated'] = max(timestamps).isoformat()
-        
-        return status
-        
-    except Exception as e:
-        logger.error(f"Failed to get training status for {ticker}: {e}")
-        return {'status': 'ERROR', 'error': str(e)}
-
-# UTILITY FUNCTIONS
-def cleanup_old_models(ticker, keep_latest=3):
-    """
-    Clean up old model files, keeping only the latest versions
-    """
-    try:
-        model_dir = Path(Config.MODEL_SAVE_PATH) / ticker
-        if not model_dir.exists():
-            return
-        
-        # This is a placeholder for more sophisticated cleanup logic
-        # In a production system, you might want to keep models with timestamps
-        logger.info(f"Cleanup functionality placeholder for {ticker}")
-        
-    except Exception as e:
-        logger.error(f"Model cleanup failed for {ticker}: {e}")
-
-def validate_model_compatibility(model_metadata, current_features):
-    """
-    Validate that a saved model is compatible with current feature set
-    """
-    if not isinstance(model_metadata, dict):
-        return False
+        try:
+            if progress_callback:
+                progress_callback(5, f"Initializing {model_type} training...")
+            
+            # Add training ID to hyperparameters for tracking
+            hparams['training_id'] = training_id
+            
+            if model_type == 'lstm':
+                result = build_and_train_lstm_optimized(
+                    df, selected_features, hparams, validation_split, progress_callback
+                )
+            elif model_type == 'xgboost':
+                result = build_and_train_xgboost_optimized(
+                    df, hparams, validation_split, progress_callback
+                )
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+            
+            # Update training record
+            training_record = {
+                'training_id': training_id,
+                'model_type': model_type,
+                'start_time': self.active_trainings[training_id]['start_time'],
+                'end_time': time.time(),
+                'success': True,
+                'result': result
+            }
+            
+            self.training_history.append(training_record)
+            del self.active_trainings[training_id]
+            
+            if progress_callback:
+                progress_callback(100, "Training completed successfully!")
+            
+            return result
+            
+        except Exception as e:
+            # Record failed training
+            training_record = {
+                'training_id': training_id,
+                'model_type': model_type,
+                'start_time': self.active_trainings[training_id]['start_time'],
+                'end_time': time.time(),
+                'success': False,
+                'error': str(e)
+            }
+            
+            self.training_history.append(training_record)
+            del self.active_trainings[training_id]
+            
+            raise
     
-    saved_features = model_metadata.get('selected_features', [])
-    if not saved_features:
-        return False
-    
-    # Check if all saved features are available in current features
-    missing_features = set(saved_features) - set(current_features)
-    if missing_features:
-        logger.warning(f"Model has missing features: {missing_features}")
-        return False
-    
-    return True
+    def get_training_stats(self) -> Dict:
+        """Get comprehensive training statistics"""
+        successful_trainings = [t for t in self.training_history if t['success']]
+        failed_trainings = [t for t in self.training_history if not t['success']]
+        
+        return {
+            'total_trainings': len(self.training_history),
+            'successful_trainings': len(successful_trainings),
+            'failed_trainings': len(failed_trainings),
+            'success_rate': len(successful_trainings) / len(self.training_history) if self.training_history else 0,
+            'active_trainings': len(self.active_trainings),
+            'avg_training_time': np.mean([
+                t['end_time'] - t['start_time'] for t in successful_trainings
+            ]) if successful_trainings else 0
+        }
 
-# MODULE TEST FUNCTION
-def test_training_module():
-    """
-    Test the training module functionality
-    """
-    try:
-        # Test data validation
-        test_df = pd.DataFrame({
-            'open': [100, 101, 102],
-            'high': [105, 106, 107],
-            'low': [98, 99, 100],
-            'close': [104, 105, 106],
-            'volume': [1000, 1100, 1200]
-        })
-        
-        validate_training_data(test_df, ['close', 'volume'])
-        logger.info("✓ Data validation test passed")
-        
-        # Test feature columns
-        feature_cols = get_feature_columns()
-        assert len(feature_cols) > 0, "No feature columns found"
-        logger.info(f"✓ Found {len(feature_cols)} feature columns")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Training module test failed: {e}")
-        return False
+# Global training manager instance
+training_manager = TrainingManager()
+
+# Backward compatibility functions
+def build_and_train_lstm(df, selected_features, hparams, validation_split=0.2, 
+                        update_callback=None):
+    """Legacy wrapper with progress callback conversion"""
+    progress_callback = None
+    if update_callback:
+        def progress_callback(progress, message):
+            update_callback({'progress': progress, 'status': message})
+    
+    return build_and_train_lstm_optimized(df, selected_features, hparams, 
+                                        validation_split, progress_callback)
+
+def build_and_train_xgboost(df, hparams, validation_split=0.2):
+    """Legacy wrapper for backward compatibility"""
+    return build_and_train_xgboost_optimized(df, hparams, validation_split)
+
+# Performance monitoring functions
+def get_training_performance_stats() -> Dict:
+    """Get detailed training performance statistics"""
+    return {
+        'training_manager': training_manager.get_training_stats(),
+        'gpu_available': torch.cuda.is_available(),
+        'gpu_memory_total': torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0,
+        'gpu_memory_allocated': torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+        'system_memory_usage': psutil.virtual_memory()._asdict()
+    }
 
 if __name__ == "__main__":
-    print("Enhanced Training Module")
-    print("=" * 40)
-    print("Features:")
-    print("- Robust LSTM training with early stopping")
-    print("- XGBoost training with asymmetric loss weighting")
-    print("- Comprehensive error handling and validation")
-    print("- Model persistence and loading")
-    print("- Progress tracking and MLflow integration")
-    print("- Async training with Celery")
+    # Performance test
+    print("Testing optimized training system...")
     
-    # Run module test
-    if test_training_module():
-        print("✓ Training module loaded and tested successfully")
-    else:
-        print("✗ Training module test failed")
+    # Generate test data
+    import pandas as pd
+    dates = pd.date_range('2020-01-01', periods=5000, freq='1H')
+    test_df = pd.DataFrame({
+        'datetime': dates,
+        'open': np.random.randn(5000).cumsum() + 100,
+        'high': np.random.randn(5000).cumsum() + 102,
+        'low': np.random.randn(5000).cumsum() + 98,
+        'close': np.random.randn(5000).cumsum() + 100,
+        'volume': np.random.randint(1000, 10000, 5000)
+    })
+    
+    # Test LSTM training
+    test_hparams = {
+        'hidden_dim': 64,
+        'n_layers': 2,
+        'dropout_prob': 0.3,
+        'learning_rate': 1e-3,
+        'epochs': 5,  # Short test
+        'batch_size': 16,
+        'teacher_forcing_ratio': 0.5
+    }
+    
+    feature_engine = OptimizedFeatureEngine()
+    test_features = feature_engine.get_feature_columns()[:10]  # Use subset for testing
+    
+    def test_progress(progress, message):
+        print(f"Progress: {progress}% - {message}")
+    
+    try:
+        print("Starting LSTM training test...")
+        result = training_manager.train_model_optimized(
+            test_df, 'lstm', test_features, test_hparams, 
+            validation_split=0.2, progress_callback=test_progress
+        )
+        print(f"LSTM test completed - Training time: {result['training_time']:.2f}s")
+        
+        # Performance stats
+        stats = get_training_performance_stats()
+        print(f"Performance stats: {stats['training_manager']}")
+        
+    except Exception as e:
+        print(f"Training test failed: {e}")
+        import traceback
+        traceback.print_exc()
+                                

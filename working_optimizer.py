@@ -133,45 +133,18 @@ class WorkingAutoOptimizer:
     async def get_universe_stocks(self, min_market_cap: float = 10e6, 
                                 max_market_cap: float = 2e9) -> List[str]:
         """Get dynamic universe of stocks based on market cap"""
-        # In production, this would query a database or API
-        # For now, we'll use a screener approach
+        from .stock_universe import get_universe_manager
         
-        universe = []
+        universe_manager = get_universe_manager()
         
-        # This would be replaced with a proper stock screener API
-        # Example: query all stocks from exchanges
-        potential_tickers = await self._get_all_exchange_tickers()
+        # Get all stocks in market cap range
+        stocks = await universe_manager.get_stocks_by_market_cap(min_market_cap, max_market_cap)
         
-        # Filter by market cap
-        for ticker in potential_tickers:
-            try:
-                info = await self.market_data_manager.get_stock_info(ticker)
-                if info and min_market_cap <= info.market_cap <= max_market_cap:
-                    universe.append(ticker)
-                    
-                if len(universe) >= 1000:  # Limit for performance
-                    break
-                    
-            except Exception as e:
-                logger.debug(f"Error checking {ticker}: {e}")
-                continue
+        # Extract tickers
+        universe = [stock.ticker for stock in stocks]
         
         logger.info(f"Universe contains {len(universe)} stocks in market cap range")
         return universe
-    
-    async def _get_all_exchange_tickers(self) -> List[str]:
-        """Get all tickers from exchanges (placeholder for real implementation)"""
-        # In production, this would query exchange APIs or databases
-        # For now, return a broader list from a screener
-        
-        # This is still limited but better than hardcoded meme stocks
-        sectors = ['Technology', 'Healthcare', 'Consumer', 'Energy', 'Financial']
-        tickers = []
-        
-        # Would be replaced with actual exchange query
-        # Example: Polygon.io ticker list endpoint
-        
-        return tickers  # Placeholder
     
     def create_model(self, input_dim: int, hparams: Dict) -> BreakoutPredictor:
         """Create actual model with given hyperparameters"""
@@ -467,7 +440,7 @@ class WorkingAutoOptimizer:
             raise
     
     async def _train_final_model(self, train_data: pd.DataFrame, best_params: Dict):
-        """Train final model with best parameters"""
+        """Train final model with best parameters and validate through backtesting"""
         # Prepare full dataset
         dataset = RealBreakoutDataset(train_data)
         X, y = dataset.prepare_sequences()
@@ -493,16 +466,120 @@ class WorkingAutoOptimizer:
                         if k in ['hidden_dim', 'n_layers', 'dropout', 'learning_rate']}
         model_hparams['epochs'] = 100  # More epochs for final model
         
-        self.current_model = self.create_model(X.shape[-1], model_hparams)
+        new_model = self.create_model(X.shape[-1], model_hparams)
         
         # Train
-        metrics = self.train_model(self.current_model, train_loader, train_loader, model_hparams)
+        metrics = self.train_model(new_model, train_loader, train_loader, model_hparams)
         
-        logger.info(f"Final model trained. Accuracy: {metrics['accuracy']:.4f}")
+        logger.info(f"New model trained. Accuracy: {metrics['accuracy']:.4f}")
         
-        # Save model
-        if get_gcs_storage():
-            self._save_model()
+        # CRITICAL: Validate new model through backtesting before deployment
+        should_deploy = await self._validate_model_performance(new_model, best_params)
+        
+        if should_deploy:
+            logger.info("New model passed validation, deploying to production")
+            self.current_model = new_model
+            
+            # Update adaptive thresholds
+            for key in self.adaptive_thresholds:
+                if key in best_params:
+                    self.adaptive_thresholds[key] = best_params[key]
+            
+            # Save model
+            if get_gcs_storage():
+                self._save_model()
+        else:
+            logger.warning("New model failed validation, keeping current model")
+    
+    async def _validate_model_performance(self, new_model, params: Dict) -> bool:
+        """Validate model performance through backtesting"""
+        from .backtesting_integrated import get_backtest_engine
+        
+        logger.info("Validating new model through backtesting...")
+        
+        try:
+            backtest_engine = await get_backtest_engine()
+            
+            # Prepare models for comparison
+            models_to_test = []
+            
+            # New model
+            models_to_test.append({
+                'name': 'new_model',
+                'model': new_model,
+                'scaler': self.current_scaler,
+                'analyzer': self.get_adaptive_analyzer(),
+                'features': dataset.feature_cols if 'dataset' in locals() else None
+            })
+            
+            # Current model (if exists)
+            if self.current_model is not None:
+                models_to_test.append({
+                    'name': 'current_model',
+                    'model': self.current_model,
+                    'scaler': self.current_scaler,
+                    'analyzer': self.get_adaptive_analyzer(),
+                    'features': dataset.feature_cols if 'dataset' in locals() else None
+                })
+            
+            # Run comparison backtest
+            comparison_results = await backtest_engine.compare_models(
+                models_to_test,
+                test_period_days=90  # 3 months of out-of-sample testing
+            )
+            
+            # Save results for audit
+            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            backtest_engine.save_backtest_results(comparison_results, model_id)
+            
+            # Decision logic
+            new_model_result = comparison_results['results'].get('new_model')
+            current_model_result = comparison_results['results'].get('current_model')
+            
+            if new_model_result is None:
+                logger.error("New model backtest failed")
+                return False
+            
+            # Validation criteria
+            min_sharpe = 1.0
+            min_win_rate = 0.55
+            max_drawdown = 0.20
+            min_profit_factor = 1.3
+            
+            # Check absolute performance
+            if (new_model_result.sharpe_ratio < min_sharpe or
+                new_model_result.win_rate < min_win_rate or
+                new_model_result.max_drawdown > max_drawdown or
+                new_model_result.profit_factor < min_profit_factor):
+                
+                logger.warning(f"New model doesn't meet minimum criteria: "
+                             f"Sharpe={new_model_result.sharpe_ratio:.2f}, "
+                             f"WinRate={new_model_result.win_rate:.2%}")
+                return False
+            
+            # If we have a current model, compare performance
+            if current_model_result:
+                # New model should be at least 10% better in key metrics
+                improvement_threshold = 1.1
+                
+                if (new_model_result.sharpe_ratio < current_model_result.sharpe_ratio * improvement_threshold and
+                    new_model_result.total_return < current_model_result.total_return * improvement_threshold):
+                    
+                    logger.warning(f"New model not sufficiently better than current: "
+                                 f"New Sharpe={new_model_result.sharpe_ratio:.2f} vs "
+                                 f"Current={current_model_result.sharpe_ratio:.2f}")
+                    return False
+            
+            logger.info(f"New model validated successfully: "
+                       f"Sharpe={new_model_result.sharpe_ratio:.2f}, "
+                       f"Return={new_model_result.total_return:.2%}, "
+                       f"Trades={new_model_result.total_trades}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Model validation failed: {e}")
+            return False
     
     def _save_model(self):
         """Save current model to storage"""

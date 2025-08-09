@@ -1,8 +1,7 @@
-# project/data_pipeline.py
+# project/eod_data_pipeline.py
 """
-Robust ETL Pipeline with TimescaleDB and Feature Store
-Provides fault-tolerant data extraction, transformation, and loading
-with versioned feature management
+EOD (End-of-Day) Data Pipeline with TimescaleDB and Feature Store
+Optimized for daily candles and volume data
 """
 
 import pandas as pd
@@ -12,7 +11,7 @@ import asyncio
 import json
 import hashlib
 from typing import Dict, List, Optional, Tuple, Any, Union
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from dataclasses import dataclass, asdict
 from enum import Enum
 import psycopg2
@@ -32,6 +31,7 @@ import traceback
 from retrying import retry
 import pyarrow as pa
 import pyarrow.parquet as pq
+import holidays
 
 # Import existing modules
 from .fixed_market_data import MarketDataManager, get_market_data_manager
@@ -42,48 +42,94 @@ logger = logging.getLogger(__name__)
 
 # ======================== Database Configuration ========================
 
-class DatabaseType(Enum):
-    """Supported database types"""
-    TIMESCALEDB = "timescaledb"
-    INFLUXDB = "influxdb"
-    POSTGRESQL = "postgresql"
-
 @dataclass
-class DatabaseConfig:
-    """Database configuration"""
-    db_type: DatabaseType = DatabaseType.TIMESCALEDB
+class EODDatabaseConfig:
+    """Database configuration for EOD data"""
     host: str = Config.DB_HOST if hasattr(Config, 'DB_HOST') else "localhost"
     port: int = Config.DB_PORT if hasattr(Config, 'DB_PORT') else 5432
-    database: str = Config.DB_NAME if hasattr(Config, 'DB_NAME') else "trading_db"
+    database: str = Config.DB_NAME if hasattr(Config, 'DB_NAME') else "trading_eod_db"
     user: str = Config.DB_USER if hasattr(Config, 'DB_USER') else "postgres"
     password: str = Config.DB_PASSWORD if hasattr(Config, 'DB_PASSWORD') else "password"
-    pool_size: int = 20
-    max_overflow: int = 40
+    pool_size: int = 10  # Reduced for EOD data (less concurrent operations)
+    max_overflow: int = 20
     
     @property
     def connection_string(self) -> str:
         """Generate connection string"""
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
-# ======================== TimescaleDB Manager ========================
+# ======================== Market Calendar ========================
 
-class TimescaleDBManager:
+class MarketCalendar:
+    """Handles market holidays and trading days"""
+    
+    def __init__(self, country: str = 'US'):
+        self.holidays = holidays.US(years=range(2020, 2030))
+        self.market_open = time(9, 30)  # 9:30 AM EST
+        self.market_close = time(16, 0)  # 4:00 PM EST
+    
+    def is_trading_day(self, date: datetime) -> bool:
+        """Check if given date is a trading day"""
+        # Check if weekend
+        if date.weekday() >= 5:  # Saturday = 5, Sunday = 6
+            return False
+        
+        # Check if holiday
+        if date.date() in self.holidays:
+            return False
+        
+        return True
+    
+    def get_last_trading_day(self, date: datetime = None) -> datetime:
+        """Get the last trading day before or on the given date"""
+        if date is None:
+            date = datetime.now()
+        
+        while not self.is_trading_day(date):
+            date -= timedelta(days=1)
+        
+        return date
+    
+    def get_next_trading_day(self, date: datetime = None) -> datetime:
+        """Get the next trading day after the given date"""
+        if date is None:
+            date = datetime.now()
+        
+        date += timedelta(days=1)
+        while not self.is_trading_day(date):
+            date += timedelta(days=1)
+        
+        return date
+    
+    def is_market_open(self) -> bool:
+        """Check if market is currently open"""
+        now = datetime.now()
+        if not self.is_trading_day(now):
+            return False
+        
+        current_time = now.time()
+        return self.market_open <= current_time <= self.market_close
+
+# ======================== EOD Database Manager ========================
+
+class EODDatabaseManager:
     """
-    Manages TimescaleDB connections and operations
-    Provides high-performance time-series data storage
+    Manages TimescaleDB for EOD data
+    Optimized for daily candles with efficient storage and retrieval
     """
     
-    def __init__(self, config: DatabaseConfig):
+    def __init__(self, config: EODDatabaseConfig):
         self.config = config
         self.engine = None
         self.connection_pool = None
         self.metadata = MetaData()
+        self.market_calendar = MarketCalendar()
         self._init_database()
     
     def _init_database(self):
         """Initialize database connection and tables"""
         try:
-            # Create SQLAlchemy engine with connection pooling
+            # Create SQLAlchemy engine
             self.engine = create_engine(
                 self.config.connection_string,
                 pool_size=self.config.pool_size,
@@ -93,9 +139,9 @@ class TimescaleDBManager:
                 echo=False
             )
             
-            # Create connection pool for raw psycopg2 operations
+            # Create connection pool
             self.connection_pool = ThreadedConnectionPool(
-                minconn=5,
+                minconn=2,
                 maxconn=self.config.pool_size,
                 host=self.config.host,
                 port=self.config.port,
@@ -105,162 +151,201 @@ class TimescaleDBManager:
             )
             
             # Create tables
-            self._create_tables()
+            self._create_eod_tables()
             
-            logger.info(f"TimescaleDB initialized successfully at {self.config.host}:{self.config.port}")
+            logger.info(f"EOD Database initialized at {self.config.host}:{self.config.port}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize TimescaleDB: {e}")
+            logger.error(f"Failed to initialize EOD Database: {e}")
             raise
     
-    def _create_tables(self):
-        """Create database tables with TimescaleDB hypertables"""
+    def _create_eod_tables(self):
+        """Create database tables optimized for EOD data"""
         with self.engine.connect() as conn:
-            # Enable TimescaleDB extension
+            # Enable TimescaleDB
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
             conn.commit()
             
-            # Market data table
+            # EOD market data table
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS market_data (
-                    time TIMESTAMPTZ NOT NULL,
+                CREATE TABLE IF NOT EXISTS eod_market_data (
+                    date DATE NOT NULL,
                     ticker VARCHAR(10) NOT NULL,
-                    open DOUBLE PRECISION,
-                    high DOUBLE PRECISION,
-                    low DOUBLE PRECISION,
+                    open DOUBLE PRECISION NOT NULL,
+                    high DOUBLE PRECISION NOT NULL,
+                    low DOUBLE PRECISION NOT NULL,
                     close DOUBLE PRECISION NOT NULL,
-                    volume BIGINT,
+                    adjusted_close DOUBLE PRECISION,
+                    volume BIGINT NOT NULL,
                     market_cap DOUBLE PRECISION,
                     shares_outstanding DOUBLE PRECISION,
+                    dividend DOUBLE PRECISION DEFAULT 0,
+                    split_factor DOUBLE PRECISION DEFAULT 1,
                     sector VARCHAR(100),
                     industry VARCHAR(100),
                     exchange VARCHAR(20),
                     data_source VARCHAR(50),
-                    created_at TIMESTAMPTZ DEFAULT NOW()
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (date, ticker)
                 )
             """))
             
-            # Convert to hypertable if not already
+            # Convert to hypertable with monthly chunks (optimal for EOD data)
             try:
                 conn.execute(text("""
-                    SELECT create_hypertable('market_data', 'time', 
-                                            chunk_time_interval => INTERVAL '1 day',
+                    SELECT create_hypertable('eod_market_data', 'date', 
+                                            chunk_time_interval => INTERVAL '1 month',
                                             if_not_exists => TRUE)
                 """))
             except Exception as e:
-                logger.debug(f"Hypertable already exists or creation skipped: {e}")
+                logger.debug(f"Hypertable already exists: {e}")
             
-            # Create indexes for better query performance
+            # Indexes for efficient queries
             conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_market_data_ticker_time 
-                ON market_data (ticker, time DESC)
+                CREATE INDEX IF NOT EXISTS idx_eod_ticker_date 
+                ON eod_market_data (ticker, date DESC)
             """))
             
             conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_market_data_time 
-                ON market_data (time DESC)
+                CREATE INDEX IF NOT EXISTS idx_eod_date 
+                ON eod_market_data (date DESC)
             """))
             
-            # Feature store table
+            # EOD Feature store
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS feature_store (
+                CREATE TABLE IF NOT EXISTS eod_features (
                     feature_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    feature_set_name VARCHAR(100) NOT NULL,
-                    feature_version INTEGER NOT NULL DEFAULT 1,
+                    feature_set VARCHAR(100) NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
                     ticker VARCHAR(10) NOT NULL,
-                    time TIMESTAMPTZ NOT NULL,
+                    date DATE NOT NULL,
                     features JSONB NOT NULL,
-                    feature_columns TEXT[],
+                    feature_list TEXT[],
                     metadata JSONB,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     is_active BOOLEAN DEFAULT TRUE,
-                    UNIQUE(feature_set_name, feature_version, ticker, time)
+                    UNIQUE(feature_set, version, ticker, date)
                 )
             """))
             
-            # Create index for feature lookups
             conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_feature_store_lookup 
-                ON feature_store (feature_set_name, ticker, time DESC)
+                CREATE INDEX IF NOT EXISTS idx_eod_features_lookup 
+                ON eod_features (ticker, date DESC)
                 WHERE is_active = TRUE
             """))
             
-            # ETL job tracking table
+            # Technical indicators table (denormalized for performance)
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS etl_jobs (
+                CREATE TABLE IF NOT EXISTS eod_technical_indicators (
+                    date DATE NOT NULL,
+                    ticker VARCHAR(10) NOT NULL,
+                    sma_5 DOUBLE PRECISION,
+                    sma_20 DOUBLE PRECISION,
+                    sma_50 DOUBLE PRECISION,
+                    sma_200 DOUBLE PRECISION,
+                    ema_12 DOUBLE PRECISION,
+                    ema_26 DOUBLE PRECISION,
+                    rsi_14 DOUBLE PRECISION,
+                    macd DOUBLE PRECISION,
+                    macd_signal DOUBLE PRECISION,
+                    bb_upper DOUBLE PRECISION,
+                    bb_middle DOUBLE PRECISION,
+                    bb_lower DOUBLE PRECISION,
+                    atr_14 DOUBLE PRECISION,
+                    adx_14 DOUBLE PRECISION,
+                    volume_sma_20 DOUBLE PRECISION,
+                    relative_volume DOUBLE PRECISION,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (date, ticker)
+                )
+            """))
+            
+            # ETL tracking
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS eod_etl_jobs (
                     job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    job_date DATE NOT NULL,
                     job_type VARCHAR(50) NOT NULL,
-                    ticker VARCHAR(10),
+                    tickers TEXT[],
                     start_time TIMESTAMPTZ NOT NULL,
                     end_time TIMESTAMPTZ,
                     status VARCHAR(20) NOT NULL,
                     records_processed INTEGER DEFAULT 0,
-                    error_message TEXT,
-                    metadata JSONB,
+                    records_failed INTEGER DEFAULT 0,
+                    error_messages JSONB,
+                    execution_time_seconds FLOAT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
             
-            # Data quality metrics table
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS data_quality_metrics (
-                    metric_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                CREATE INDEX IF NOT EXISTS idx_eod_etl_jobs_date 
+                ON eod_etl_jobs (job_date DESC)
+            """))
+            
+            # Data quality tracking
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS eod_data_quality (
+                    date DATE NOT NULL,
                     ticker VARCHAR(10) NOT NULL,
-                    metric_date DATE NOT NULL,
+                    has_gaps BOOLEAN DEFAULT FALSE,
+                    gap_dates DATE[],
                     completeness_score FLOAT,
-                    accuracy_score FLOAT,
-                    timeliness_score FLOAT,
-                    consistency_score FLOAT,
-                    missing_data_points INTEGER,
-                    anomaly_count INTEGER,
-                    metadata JSONB,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(ticker, metric_date)
+                    volume_anomaly BOOLEAN DEFAULT FALSE,
+                    price_anomaly BOOLEAN DEFAULT FALSE,
+                    last_check TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (date, ticker)
                 )
             """))
             
-            # Create continuous aggregates for real-time analytics
+            # Weekly/Monthly aggregates for faster backtesting
             conn.execute(text("""
-                CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_hourly
-                WITH (timescaledb.continuous) AS
+                CREATE MATERIALIZED VIEW IF NOT EXISTS eod_weekly_data AS
                 SELECT 
-                    time_bucket('1 hour', time) AS bucket,
+                    date_trunc('week', date) AS week,
                     ticker,
-                    first(open, time) as open,
+                    first(open, date) as open,
                     max(high) as high,
                     min(low) as low,
-                    last(close, time) as close,
+                    last(close, date) as close,
                     sum(volume) as volume,
-                    avg(market_cap) as avg_market_cap
-                FROM market_data
-                GROUP BY bucket, ticker
+                    avg(market_cap) as avg_market_cap,
+                    count(*) as trading_days
+                FROM eod_market_data
+                GROUP BY week, ticker
                 WITH NO DATA
             """))
             
-            # Create refresh policy for continuous aggregate
-            try:
-                conn.execute(text("""
-                    SELECT add_continuous_aggregate_policy('market_data_hourly',
-                        start_offset => INTERVAL '3 days',
-                        end_offset => INTERVAL '1 hour',
-                        schedule_interval => INTERVAL '1 hour',
-                        if_not_exists => TRUE)
-                """))
-            except Exception as e:
-                logger.debug(f"Continuous aggregate policy already exists: {e}")
+            conn.execute(text("""
+                CREATE MATERIALIZED VIEW IF NOT EXISTS eod_monthly_data AS
+                SELECT 
+                    date_trunc('month', date) AS month,
+                    ticker,
+                    first(open, date) as open,
+                    max(high) as high,
+                    min(low) as low,
+                    last(close, date) as close,
+                    sum(volume) as volume,
+                    avg(market_cap) as avg_market_cap,
+                    count(*) as trading_days
+                FROM eod_market_data
+                GROUP BY month, ticker
+                WITH NO DATA
+            """))
             
-            # Data retention policy (keep detailed data for 2 years)
+            # Retention policy (keep daily data for 10 years)
             try:
                 conn.execute(text("""
-                    SELECT add_retention_policy('market_data', 
-                        drop_after => INTERVAL '2 years',
+                    SELECT add_retention_policy('eod_market_data', 
+                        drop_after => INTERVAL '10 years',
                         if_not_exists => TRUE)
                 """))
             except Exception as e:
                 logger.debug(f"Retention policy already exists: {e}")
             
             conn.commit()
-            logger.info("Database tables created successfully")
+            logger.info("EOD database tables created successfully")
     
     @contextmanager
     def get_connection(self):
@@ -272,73 +357,78 @@ class TimescaleDBManager:
             self.connection_pool.putconn(conn)
     
     @retry(stop_max_attempt_number=3, wait_fixed=1000)
-    def insert_market_data(self, data: List[Dict]) -> int:
-        """Insert market data with retry logic"""
+    def insert_eod_data(self, data: List[Dict]) -> int:
+        """Insert EOD market data with upsert logic"""
         if not data:
             return 0
         
         with self.get_connection() as conn:
             cur = conn.cursor()
             try:
-                # Prepare insert query
                 insert_query = """
-                    INSERT INTO market_data (
-                        time, ticker, open, high, low, close, volume,
-                        market_cap, shares_outstanding, sector, industry, 
-                        exchange, data_source
+                    INSERT INTO eod_market_data (
+                        date, ticker, open, high, low, close, adjusted_close,
+                        volume, market_cap, shares_outstanding, dividend, split_factor,
+                        sector, industry, exchange, data_source, updated_at
                     ) VALUES (
-                        %(time)s, %(ticker)s, %(open)s, %(high)s, %(low)s, 
-                        %(close)s, %(volume)s, %(market_cap)s, %(shares_outstanding)s,
-                        %(sector)s, %(industry)s, %(exchange)s, %(data_source)s
+                        %(date)s, %(ticker)s, %(open)s, %(high)s, %(low)s, %(close)s,
+                        %(adjusted_close)s, %(volume)s, %(market_cap)s, %(shares_outstanding)s,
+                        %(dividend)s, %(split_factor)s, %(sector)s, %(industry)s,
+                        %(exchange)s, %(data_source)s, NOW()
                     )
-                    ON CONFLICT (time, ticker) DO UPDATE SET
+                    ON CONFLICT (date, ticker) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
                         close = EXCLUDED.close,
+                        adjusted_close = EXCLUDED.adjusted_close,
                         volume = EXCLUDED.volume,
-                        market_cap = EXCLUDED.market_cap
+                        market_cap = EXCLUDED.market_cap,
+                        updated_at = NOW()
                 """
                 
-                # Batch insert for better performance
-                execute_batch(cur, insert_query, data, page_size=1000)
+                execute_batch(cur, insert_query, data, page_size=500)
                 conn.commit()
                 
                 rows_inserted = len(data)
-                logger.info(f"Inserted {rows_inserted} market data records")
+                logger.info(f"Inserted/Updated {rows_inserted} EOD records")
                 return rows_inserted
                 
             except Exception as e:
                 conn.rollback()
-                logger.error(f"Failed to insert market data: {e}")
+                logger.error(f"Failed to insert EOD data: {e}")
                 raise
             finally:
                 cur.close()
     
-    def get_market_data(self, ticker: str, start_time: datetime, 
-                       end_time: datetime) -> pd.DataFrame:
-        """Retrieve market data for a ticker within time range"""
+    def get_eod_data(self, ticker: str, start_date: datetime, 
+                    end_date: datetime) -> pd.DataFrame:
+        """Get EOD data for a ticker"""
         query = """
-            SELECT time, ticker, open, high, low, close, volume, 
+            SELECT date, open, high, low, close, adjusted_close, volume,
                    market_cap, shares_outstanding
-            FROM market_data
-            WHERE ticker = %s AND time >= %s AND time <= %s
-            ORDER BY time ASC
+            FROM eod_market_data
+            WHERE ticker = %s AND date >= %s AND date <= %s
+            ORDER BY date ASC
         """
         
         with self.get_connection() as conn:
             df = pd.read_sql_query(
                 query, 
                 conn, 
-                params=(ticker, start_time, end_time),
-                parse_dates=['time']
+                params=(ticker, start_date.date(), end_date.date()),
+                parse_dates=['date']
             )
+            df.set_index('date', inplace=True)
             return df
     
-    def get_latest_market_data(self, ticker: str, limit: int = 1000) -> pd.DataFrame:
-        """Get latest market data for a ticker"""
+    def get_latest_eod_data(self, ticker: str, days: int = 252) -> pd.DataFrame:
+        """Get latest EOD data (default 1 trading year = 252 days)"""
         query = """
-            SELECT time, ticker, open, high, low, close, volume
-            FROM market_data
+            SELECT date, open, high, low, close, adjusted_close, volume
+            FROM eod_market_data
             WHERE ticker = %s
-            ORDER BY time DESC
+            ORDER BY date DESC
             LIMIT %s
         """
         
@@ -346,210 +436,334 @@ class TimescaleDBManager:
             df = pd.read_sql_query(
                 query,
                 conn,
-                params=(ticker, limit),
-                parse_dates=['time']
+                params=(ticker, days),
+                parse_dates=['date']
             )
-            # Reverse to get chronological order
-            return df.iloc[::-1].reset_index(drop=True)
+            df = df.sort_values('date')
+            df.set_index('date', inplace=True)
+            return df
+    
+    def check_data_gaps(self, ticker: str, start_date: datetime, 
+                       end_date: datetime) -> Dict:
+        """Check for missing trading days in data"""
+        # Get existing data
+        existing_data = self.get_eod_data(ticker, start_date, end_date)
+        existing_dates = set(existing_data.index.date)
+        
+        # Generate expected trading days
+        expected_dates = []
+        current_date = start_date
+        while current_date <= end_date:
+            if self.market_calendar.is_trading_day(current_date):
+                expected_dates.append(current_date.date())
+            current_date += timedelta(days=1)
+        
+        expected_dates = set(expected_dates)
+        
+        # Find gaps
+        missing_dates = expected_dates - existing_dates
+        
+        return {
+            'ticker': ticker,
+            'expected_days': len(expected_dates),
+            'actual_days': len(existing_dates),
+            'missing_days': len(missing_dates),
+            'missing_dates': sorted(list(missing_dates)),
+            'completeness': len(existing_dates) / len(expected_dates) if expected_dates else 0
+        }
 
-# ======================== Feature Store Manager ========================
+# ======================== EOD Feature Store ========================
 
-class FeatureStore:
+class EODFeatureStore:
     """
-    Centralized feature store for consistent feature management
-    Ensures feature consistency between training and inference
+    Feature store optimized for EOD data
+    Manages daily features with efficient storage and retrieval
     """
     
-    def __init__(self, db_manager: TimescaleDBManager, cache_client: Optional[redis.Redis] = None):
+    def __init__(self, db_manager: EODDatabaseManager, cache_client: Optional[redis.Redis] = None):
         self.db = db_manager
         self.cache = cache_client
         self.feature_engine = OptimizedFeatureEngine(use_cache=True)
-        self.feature_versions = {}
         
-    def _generate_feature_hash(self, features: pd.DataFrame) -> str:
-        """Generate hash for feature versioning"""
-        feature_str = pd.util.hash_pandas_object(features).sum()
-        return hashlib.md5(str(feature_str).encode()).hexdigest()
-    
-    def save_features(self, ticker: str, features: pd.DataFrame, 
-                     feature_set_name: str = "default", 
-                     metadata: Optional[Dict] = None) -> str:
-        """Save features to feature store with versioning"""
-        try:
-            # Get or create feature version
-            version = self.feature_versions.get(feature_set_name, 1)
+    def compute_eod_features(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """Compute features specifically for EOD data"""
+        # Ensure we have enough data
+        if len(df) < 200:  # Need at least 200 days for SMA_200
+            logger.warning(f"Insufficient data for {ticker}: {len(df)} days")
             
-            # Prepare feature data
+        # Use optimized feature engine for base features
+        features_df = self.feature_engine.create_features_optimized(df)
+        
+        # Add EOD-specific features
+        # Returns
+        features_df['returns_1d'] = features_df['close'].pct_change()
+        features_df['returns_5d'] = features_df['close'].pct_change(periods=5)
+        features_df['returns_20d'] = features_df['close'].pct_change(periods=20)
+        features_df['returns_60d'] = features_df['close'].pct_change(periods=60)
+        
+        # Log returns
+        features_df['log_returns'] = np.log(features_df['close'] / features_df['close'].shift(1))
+        
+        # Moving averages (additional)
+        features_df['sma_50'] = features_df['close'].rolling(window=50).mean()
+        features_df['sma_200'] = features_df['close'].rolling(window=200).mean()
+        
+        # Volume features
+        features_df['volume_sma_20'] = features_df['volume'].rolling(window=20).mean()
+        features_df['relative_volume'] = features_df['volume'] / features_df['volume_sma_20']
+        
+        # Price position indicators
+        features_df['price_to_sma20'] = features_df['close'] / features_df['sma_20']
+        features_df['price_to_sma50'] = features_df['close'] / features_df['sma_50']
+        features_df['price_to_sma200'] = features_df['close'] / features_df['sma_200']
+        
+        # Volatility measures
+        features_df['volatility_20d'] = features_df['returns_1d'].rolling(window=20).std()
+        features_df['volatility_60d'] = features_df['returns_1d'].rolling(window=60).std()
+        
+        # High/Low indicators
+        features_df['high_20d'] = features_df['high'].rolling(window=20).max()
+        features_df['low_20d'] = features_df['low'].rolling(window=20).min()
+        features_df['price_position_20d'] = (features_df['close'] - features_df['low_20d']) / (features_df['high_20d'] - features_df['low_20d'])
+        
+        features_df['high_52w'] = features_df['high'].rolling(window=252).max()
+        features_df['low_52w'] = features_df['low'].rolling(window=252).min()
+        features_df['price_position_52w'] = (features_df['close'] - features_df['low_52w']) / (features_df['high_52w'] - features_df['low_52w'])
+        
+        # MACD
+        exp1 = features_df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = features_df['close'].ewm(span=26, adjust=False).mean()
+        features_df['macd'] = exp1 - exp2
+        features_df['macd_signal'] = features_df['macd'].ewm(span=9, adjust=False).mean()
+        features_df['macd_histogram'] = features_df['macd'] - features_df['macd_signal']
+        
+        # ADX (Average Directional Index)
+        features_df['adx_14'] = self._calculate_adx(df, period=14)
+        
+        # Money Flow Index
+        features_df['mfi_14'] = self._calculate_mfi(df, period=14)
+        
+        # Fill NaN values
+        features_df.fillna(method='ffill', inplace=True)
+        features_df.fillna(0, inplace=True)
+        
+        return features_df
+    
+    def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index"""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        
+        plus_dm = high.diff()
+        minus_dm = low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm > 0] = 0
+        
+        tr1 = pd.DataFrame(high - low)
+        tr2 = pd.DataFrame(abs(high - close.shift(1)))
+        tr3 = pd.DataFrame(abs(low - close.shift(1)))
+        tr = pd.concat([tr1, tr2, tr3], axis=1, join='inner').max(axis=1)
+        atr = tr.rolling(period).mean()
+        
+        plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+        minus_di = abs(100 * (minus_dm.rolling(period).mean() / atr))
+        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+        adx = dx.rolling(period).mean()
+        
+        return adx
+    
+    def _calculate_mfi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Money Flow Index"""
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        money_flow = typical_price * df['volume']
+        
+        positive_flow = []
+        negative_flow = []
+        
+        for i in range(1, len(typical_price)):
+            if typical_price[i] > typical_price[i-1]:
+                positive_flow.append(money_flow[i])
+                negative_flow.append(0)
+            elif typical_price[i] < typical_price[i-1]:
+                positive_flow.append(0)
+                negative_flow.append(money_flow[i])
+            else:
+                positive_flow.append(0)
+                negative_flow.append(0)
+        
+        positive_flow = pd.Series(positive_flow, index=df.index[1:])
+        negative_flow = pd.Series(negative_flow, index=df.index[1:])
+        
+        positive_flow_sum = positive_flow.rolling(period).sum()
+        negative_flow_sum = negative_flow.rolling(period).sum()
+        
+        money_ratio = positive_flow_sum / negative_flow_sum
+        mfi = 100 - (100 / (1 + money_ratio))
+        
+        # Add NaN for the first value to match the DataFrame length
+        mfi = pd.concat([pd.Series([np.nan], index=df.index[:1]), mfi])
+        
+        return mfi
+    
+    def save_eod_features(self, ticker: str, features: pd.DataFrame, 
+                         feature_set: str = "eod_default") -> bool:
+        """Save EOD features to database"""
+        try:
             feature_records = []
-            for idx, row in features.iterrows():
-                # Extract time from index or datetime column
-                if isinstance(idx, pd.Timestamp):
-                    time = idx
-                elif 'datetime' in features.columns:
-                    time = row['datetime']
-                else:
-                    time = datetime.now()
-                
-                # Convert row to dict excluding time
+            for date, row in features.iterrows():
                 feature_dict = row.to_dict()
-                if 'datetime' in feature_dict:
-                    del feature_dict['datetime']
+                
+                # Remove infinite values
+                feature_dict = {k: v if not np.isinf(v) else 0 for k, v in feature_dict.items()}
                 
                 feature_records.append({
-                    'feature_set_name': feature_set_name,
-                    'feature_version': version,
+                    'feature_set': feature_set,
+                    'version': 1,
                     'ticker': ticker,
-                    'time': time,
-                    'features': json.dumps(feature_dict),
-                    'feature_columns': list(feature_dict.keys()),
-                    'metadata': json.dumps(metadata) if metadata else None
+                    'date': date,
+                    'features': json.dumps(feature_dict, default=str),
+                    'feature_list': list(feature_dict.keys())
                 })
             
-            # Insert into database
             with self.db.get_connection() as conn:
                 cur = conn.cursor()
                 
                 insert_query = """
-                    INSERT INTO feature_store (
-                        feature_set_name, feature_version, ticker, time,
-                        features, feature_columns, metadata
+                    INSERT INTO eod_features (
+                        feature_set, version, ticker, date, features, feature_list
                     ) VALUES (
-                        %(feature_set_name)s, %(feature_version)s, %(ticker)s,
-                        %(time)s, %(features)s, %(feature_columns)s, %(metadata)s
+                        %(feature_set)s, %(version)s, %(ticker)s, %(date)s,
+                        %(features)s, %(feature_list)s
                     )
-                    ON CONFLICT (feature_set_name, feature_version, ticker, time) 
+                    ON CONFLICT (feature_set, version, ticker, date) 
                     DO UPDATE SET
                         features = EXCLUDED.features,
-                        feature_columns = EXCLUDED.feature_columns,
-                        metadata = EXCLUDED.metadata
+                        feature_list = EXCLUDED.feature_list
                 """
                 
-                execute_batch(cur, insert_query, feature_records, page_size=1000)
+                execute_batch(cur, insert_query, feature_records, page_size=500)
                 conn.commit()
                 
                 logger.info(f"Saved {len(feature_records)} feature records for {ticker}")
-                
-                # Cache latest features if cache is available
-                if self.cache:
-                    cache_key = f"features:{ticker}:{feature_set_name}:latest"
-                    self.cache.setex(
-                        cache_key, 
-                        3600,  # 1 hour TTL
-                        pickle.dumps(features.tail(100))  # Cache last 100 rows
-                    )
-                
-                return f"{feature_set_name}_v{version}"
+                return True
                 
         except Exception as e:
-            logger.error(f"Failed to save features: {e}")
-            raise
+            logger.error(f"Failed to save EOD features: {e}")
+            return False
     
-    def load_features(self, ticker: str, start_time: datetime, end_time: datetime,
-                     feature_set_name: str = "default",
-                     version: Optional[int] = None) -> pd.DataFrame:
-        """Load features from feature store"""
-        
-        # Try cache first for recent data
-        if self.cache and (end_time - start_time).days <= 7:
-            cache_key = f"features:{ticker}:{feature_set_name}:{start_time}:{end_time}"
-            cached_data = self.cache.get(cache_key)
-            if cached_data:
-                logger.info(f"Loaded features from cache for {ticker}")
-                return pickle.loads(cached_data)
-        
-        # Query from database
+    def load_eod_features(self, ticker: str, start_date: datetime, 
+                         end_date: datetime, feature_set: str = "eod_default") -> pd.DataFrame:
+        """Load EOD features from database"""
         query = """
-            SELECT time, features, feature_columns
-            FROM feature_store
+            SELECT date, features
+            FROM eod_features
             WHERE ticker = %s 
-                AND feature_set_name = %s
-                AND time >= %s 
-                AND time <= %s
+                AND feature_set = %s
+                AND date >= %s 
+                AND date <= %s
                 AND is_active = TRUE
+            ORDER BY date ASC
         """
-        
-        params = [ticker, feature_set_name, start_time, end_time]
-        
-        if version is not None:
-            query += " AND feature_version = %s"
-            params.append(version)
-        else:
-            query += " AND feature_version = (SELECT MAX(feature_version) FROM feature_store WHERE ticker = %s AND feature_set_name = %s)"
-            params.extend([ticker, feature_set_name])
-        
-        query += " ORDER BY time ASC"
         
         with self.db.get_connection() as conn:
             cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute(query, params)
+            cur.execute(query, (ticker, feature_set, start_date.date(), end_date.date()))
             rows = cur.fetchall()
             
             if not rows:
-                logger.warning(f"No features found for {ticker} in {feature_set_name}")
                 return pd.DataFrame()
             
-            # Convert to DataFrame
             data = []
             for row in rows:
                 feature_dict = json.loads(row['features'])
-                feature_dict['time'] = row['time']
+                feature_dict['date'] = row['date']
                 data.append(feature_dict)
             
             df = pd.DataFrame(data)
-            df.set_index('time', inplace=True)
-            
-            # Cache the result
-            if self.cache:
-                cache_key = f"features:{ticker}:{feature_set_name}:{start_time}:{end_time}"
-                self.cache.setex(cache_key, 3600, pickle.dumps(df))
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
             
             return df
     
-    def get_feature_metadata(self, feature_set_name: str = "default") -> Dict:
-        """Get metadata about a feature set"""
-        query = """
-            SELECT 
-                feature_version,
-                COUNT(DISTINCT ticker) as n_tickers,
-                COUNT(DISTINCT time) as n_timestamps,
-                MIN(time) as earliest_time,
-                MAX(time) as latest_time,
-                array_agg(DISTINCT unnest(feature_columns)) as all_features
-            FROM feature_store
-            WHERE feature_set_name = %s AND is_active = TRUE
-            GROUP BY feature_version
-            ORDER BY feature_version DESC
-        """
-        
-        with self.db.get_connection() as conn:
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute(query, (feature_set_name,))
-            results = cur.fetchall()
+    def save_technical_indicators(self, ticker: str, indicators: pd.DataFrame) -> bool:
+        """Save pre-computed technical indicators for fast access"""
+        try:
+            records = []
+            for date, row in indicators.iterrows():
+                record = {
+                    'date': date,
+                    'ticker': ticker,
+                    'sma_5': row.get('sma_5'),
+                    'sma_20': row.get('sma_20'),
+                    'sma_50': row.get('sma_50'),
+                    'sma_200': row.get('sma_200'),
+                    'ema_12': row.get('ema_12'),
+                    'ema_26': row.get('ema_26'),
+                    'rsi_14': row.get('rsi_14'),
+                    'macd': row.get('macd'),
+                    'macd_signal': row.get('macd_signal'),
+                    'bb_upper': row.get('bb_upper'),
+                    'bb_middle': row.get('sma_20'),  # BB middle is SMA20
+                    'bb_lower': row.get('bb_lower'),
+                    'atr_14': row.get('atr_14'),
+                    'adx_14': row.get('adx_14'),
+                    'volume_sma_20': row.get('volume_sma_20'),
+                    'relative_volume': row.get('relative_volume')
+                }
+                records.append(record)
             
-            return {
-                'versions': results,
-                'latest_version': results[0]['feature_version'] if results else 0,
-                'total_versions': len(results)
-            }
+            with self.db.get_connection() as conn:
+                cur = conn.cursor()
+                
+                insert_query = """
+                    INSERT INTO eod_technical_indicators (
+                        date, ticker, sma_5, sma_20, sma_50, sma_200,
+                        ema_12, ema_26, rsi_14, macd, macd_signal,
+                        bb_upper, bb_middle, bb_lower, atr_14, adx_14,
+                        volume_sma_20, relative_volume
+                    ) VALUES (
+                        %(date)s, %(ticker)s, %(sma_5)s, %(sma_20)s, %(sma_50)s, %(sma_200)s,
+                        %(ema_12)s, %(ema_26)s, %(rsi_14)s, %(macd)s, %(macd_signal)s,
+                        %(bb_upper)s, %(bb_middle)s, %(bb_lower)s, %(atr_14)s, %(adx_14)s,
+                        %(volume_sma_20)s, %(relative_volume)s
+                    )
+                    ON CONFLICT (date, ticker) DO UPDATE SET
+                        sma_5 = EXCLUDED.sma_5,
+                        sma_20 = EXCLUDED.sma_20,
+                        sma_50 = EXCLUDED.sma_50,
+                        sma_200 = EXCLUDED.sma_200,
+                        rsi_14 = EXCLUDED.rsi_14,
+                        macd = EXCLUDED.macd
+                """
+                
+                execute_batch(cur, insert_query, records, page_size=500)
+                conn.commit()
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to save technical indicators: {e}")
+            return False
 
-# ======================== ETL Pipeline ========================
+# ======================== EOD ETL Pipeline ========================
 
-class ETLPipeline:
+class EODETLPipeline:
     """
-    Main ETL Pipeline orchestrator
-    Handles data extraction, transformation, and loading
+    ETL Pipeline optimized for End-of-Day data processing
+    Runs once daily after market close
     """
     
-    def __init__(self, config: DatabaseConfig):
-        self.db_manager = TimescaleDBManager(config)
-        self.feature_store = FeatureStore(self.db_manager, self._init_redis())
+    def __init__(self, config: EODDatabaseConfig):
+        self.db_manager = EODDatabaseManager(config)
+        self.feature_store = EODFeatureStore(self.db_manager, self._init_redis())
         self.market_data_manager = None
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.market_calendar = MarketCalendar()
+        self.executor = ThreadPoolExecutor(max_workers=5)  # Less parallelism needed for EOD
         self.running = False
-        self.jobs = {}
         
     def _init_redis(self) -> Optional[redis.Redis]:
-        """Initialize Redis connection for caching"""
+        """Initialize Redis for caching"""
         try:
             redis_client = redis.from_url(
                 Config.CELERY_RESULT_BACKEND if hasattr(Config, 'CELERY_RESULT_BACKEND') 
@@ -557,205 +771,147 @@ class ETLPipeline:
                 decode_responses=False
             )
             redis_client.ping()
-            logger.info("Redis cache initialized for ETL pipeline")
+            logger.info("Redis cache initialized for EOD pipeline")
             return redis_client
         except Exception as e:
-            logger.warning(f"Redis not available, continuing without cache: {e}")
+            logger.warning(f"Redis not available: {e}")
             return None
     
     async def initialize(self):
-        """Initialize the ETL pipeline"""
+        """Initialize the pipeline"""
         self.market_data_manager = await get_market_data_manager()
-        logger.info("ETL Pipeline initialized")
+        logger.info("EOD ETL Pipeline initialized")
     
-    def _track_job(self, job_type: str, ticker: Optional[str] = None) -> str:
+    def _track_job(self, job_type: str, tickers: List[str], job_date: datetime) -> str:
         """Track ETL job execution"""
-        job_id = str(datetime.now().timestamp())
-        
         with self.db_manager.get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO etl_jobs (job_type, ticker, start_time, status)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO eod_etl_jobs (job_date, job_type, tickers, start_time, status)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING job_id
-            """, (job_type, ticker, datetime.now(), "RUNNING"))
+            """, (job_date.date(), job_type, tickers, datetime.now(), "RUNNING"))
             
             job_id = cur.fetchone()[0]
             conn.commit()
             
-        self.jobs[job_id] = {
-            'type': job_type,
-            'ticker': ticker,
-            'start_time': datetime.now()
-        }
-        
         return job_id
     
-    def _complete_job(self, job_id: str, status: str, records: int = 0, 
-                     error: Optional[str] = None):
-        """Mark job as complete"""
+    def _complete_job(self, job_id: str, status: str, records_processed: int = 0, 
+                     records_failed: int = 0, errors: List[str] = None):
+        """Complete job tracking"""
+        end_time = datetime.now()
+        
         with self.db_manager.get_connection() as conn:
             cur = conn.cursor()
+            
+            # Get start time
+            cur.execute("SELECT start_time FROM eod_etl_jobs WHERE job_id = %s", (job_id,))
+            start_time = cur.fetchone()[0]
+            execution_time = (end_time - start_time).total_seconds()
+            
             cur.execute("""
-                UPDATE etl_jobs 
-                SET end_time = %s, status = %s, records_processed = %s, error_message = %s
+                UPDATE eod_etl_jobs 
+                SET end_time = %s, status = %s, records_processed = %s, 
+                    records_failed = %s, error_messages = %s, execution_time_seconds = %s
                 WHERE job_id = %s
-            """, (datetime.now(), status, records, error, job_id))
+            """, (end_time, status, records_processed, records_failed, 
+                  json.dumps(errors) if errors else None, execution_time, job_id))
             conn.commit()
-        
-        if job_id in self.jobs:
-            del self.jobs[job_id]
     
-    async def extract_market_data(self, ticker: str, days_back: int = 30) -> pd.DataFrame:
-        """Extract market data from providers"""
-        job_id = self._track_job("EXTRACT", ticker)
-        
+    async def extract_eod_data(self, ticker: str, days_back: int = 252) -> pd.DataFrame:
+        """Extract EOD data for a ticker (default 1 year)"""
         try:
-            # Get stock info
-            stock_info = await self.market_data_manager.get_stock_info(ticker)
-            if not stock_info:
-                raise ValueError(f"Could not get stock info for {ticker}")
+            end_date = self.market_calendar.get_last_trading_day()
+            start_date = end_date - timedelta(days=days_back * 1.5)  # Extra buffer for holidays
             
             # Get historical data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days_back)
-            
             historical_data = await self.market_data_manager.get_historical_data(
                 ticker, start_date, end_date
             )
             
             if historical_data is None or historical_data.empty:
-                raise ValueError(f"No historical data found for {ticker}")
+                raise ValueError(f"No data found for {ticker}")
             
-            # Combine with stock info
+            # Get stock info for metadata
+            stock_info = await self.market_data_manager.get_stock_info(ticker)
+            
+            # Add metadata
+            if stock_info:
+                historical_data['market_cap'] = stock_info.market_cap
+                historical_data['shares_outstanding'] = stock_info.shares_outstanding
+                historical_data['sector'] = stock_info.sector
+                historical_data['industry'] = stock_info.industry
+                historical_data['exchange'] = stock_info.exchange
+            
             historical_data['ticker'] = ticker
-            historical_data['market_cap'] = stock_info.market_cap
-            historical_data['shares_outstanding'] = stock_info.shares_outstanding
-            historical_data['sector'] = stock_info.sector
-            historical_data['industry'] = stock_info.industry
-            historical_data['exchange'] = stock_info.exchange
             historical_data['data_source'] = "polygon"
             
-            self._complete_job(job_id, "SUCCESS", len(historical_data))
-            logger.info(f"Extracted {len(historical_data)} records for {ticker}")
+            # Ensure we have date column
+            if 'datetime' in historical_data.columns:
+                historical_data['date'] = pd.to_datetime(historical_data['datetime']).dt.date
+            else:
+                historical_data['date'] = historical_data.index.date
             
+            # Calculate adjusted close (simplified - would need actual dividend/split data)
+            historical_data['adjusted_close'] = historical_data['close']
+            historical_data['dividend'] = 0
+            historical_data['split_factor'] = 1
+            
+            logger.info(f"Extracted {len(historical_data)} EOD records for {ticker}")
             return historical_data
             
         except Exception as e:
-            self._complete_job(job_id, "FAILED", 0, str(e))
-            logger.error(f"Failed to extract data for {ticker}: {e}")
+            logger.error(f"Failed to extract EOD data for {ticker}: {e}")
             raise
     
-    def transform_and_compute_features(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-        """Transform data and compute features"""
-        job_id = self._track_job("TRANSFORM", ticker)
+    def validate_eod_data(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """Validate and clean EOD data"""
+        initial_count = len(df)
         
-        try:
-            # Data quality checks
-            df = self._validate_and_clean_data(df)
-            
-            # Compute features using the optimized feature engine
-            features_df = self.feature_store.feature_engine.create_features_optimized(df)
-            
-            # Additional custom features
-            features_df['ticker'] = ticker
-            
-            # Calculate additional metrics
-            features_df['price_momentum'] = features_df['close'].pct_change(periods=20)
-            features_df['volume_ratio'] = features_df['volume'] / features_df['volume'].rolling(20).mean()
-            
-            self._complete_job(job_id, "SUCCESS", len(features_df))
-            logger.info(f"Computed {len(features_df.columns)} features for {ticker}")
-            
-            return features_df
-            
-        except Exception as e:
-            self._complete_job(job_id, "FAILED", 0, str(e))
-            logger.error(f"Failed to transform data for {ticker}: {e}")
-            raise
-    
-    def _validate_and_clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate and clean market data"""
         # Remove duplicates
-        df = df.drop_duplicates()
+        df = df.drop_duplicates(subset=['date'])
+        
+        # Validate OHLC relationships
+        invalid_mask = (
+            (df['high'] < df['low']) |
+            (df['high'] < df['open']) |
+            (df['high'] < df['close']) |
+            (df['low'] > df['open']) |
+            (df['low'] > df['close']) |
+            (df['volume'] < 0)
+        )
+        
+        if invalid_mask.any():
+            logger.warning(f"Found {invalid_mask.sum()} invalid records for {ticker}")
+            df = df[~invalid_mask]
         
         # Handle missing values
         df['volume'] = df['volume'].fillna(0)
-        
-        # Forward fill price data
-        price_cols = ['open', 'high', 'low', 'close']
+        price_cols = ['open', 'high', 'low', 'close', 'adjusted_close']
         df[price_cols] = df[price_cols].ffill()
         
-        # Remove rows with all NaN prices
-        df = df.dropna(subset=price_cols, how='all')
+        # Remove extreme outliers (> 50% daily change)
+        df['daily_change'] = df['close'].pct_change()
+        extreme_moves = df['daily_change'].abs() > 0.5
+        if extreme_moves.any():
+            logger.warning(f"Found {extreme_moves.sum()} extreme moves for {ticker}")
+            # Keep them but flag for review
         
-        # Validate price relationships
-        df = df[(df['high'] >= df['low']) & 
-               (df['high'] >= df['open']) & 
-               (df['high'] >= df['close']) &
-               (df['low'] <= df['open']) & 
-               (df['low'] <= df['close'])]
+        df = df.drop(columns=['daily_change'])
         
-        # Remove outliers (prices outside 5 standard deviations)
-        for col in price_cols:
-            mean = df[col].mean()
-            std = df[col].std()
-            df = df[np.abs(df[col] - mean) <= (5 * std)]
+        final_count = len(df)
+        if final_count < initial_count:
+            logger.info(f"Cleaned {initial_count - final_count} invalid records for {ticker}")
         
         return df
     
-    async def load_to_database(self, df: pd.DataFrame, ticker: str) -> int:
-        """Load data to database"""
-        job_id = self._track_job("LOAD", ticker)
+    async def process_ticker_eod(self, ticker: str, lookback_days: int = 252) -> Dict:
+        """Process complete EOD pipeline for a single ticker"""
+        job_date = self.market_calendar.get_last_trading_day()
+        job_id = self._track_job("EOD_FULL", [ticker], job_date)
         
-        try:
-            # Prepare market data records
-            market_records = []
-            for idx, row in df.iterrows():
-                if isinstance(idx, pd.Timestamp):
-                    time = idx
-                elif 'datetime' in df.columns:
-                    time = row['datetime'] 
-                else:
-                    time = datetime.now()
-                
-                market_records.append({
-                    'time': time,
-                    'ticker': ticker,
-                    'open': row.get('open'),
-                    'high': row.get('high'),
-                    'low': row.get('low'),
-                    'close': row.get('close'),
-                    'volume': row.get('volume'),
-                    'market_cap': row.get('market_cap'),
-                    'shares_outstanding': row.get('shares_outstanding'),
-                    'sector': row.get('sector'),
-                    'industry': row.get('industry'),
-                    'exchange': row.get('exchange'),
-                    'data_source': row.get('data_source', 'unknown')
-                })
-            
-            # Insert market data
-            records_inserted = self.db_manager.insert_market_data(market_records)
-            
-            # Save features to feature store
-            self.feature_store.save_features(ticker, df, "etl_pipeline")
-            
-            self._complete_job(job_id, "SUCCESS", records_inserted)
-            logger.info(f"Loaded {records_inserted} records for {ticker}")
-            
-            return records_inserted
-            
-        except Exception as e:
-            self._complete_job(job_id, "FAILED", 0, str(e))
-            logger.error(f"Failed to load data for {ticker}: {e}")
-            raise
-    
-    async def run_etl_for_ticker(self, ticker: str, days_back: int = 30) -> Dict:
-        """Run complete ETL pipeline for a ticker"""
-        logger.info(f"Starting ETL pipeline for {ticker}")
-        
-        results = {
+        result = {
             'ticker': ticker,
             'success': False,
             'records_processed': 0,
@@ -765,279 +921,176 @@ class ETLPipeline:
         
         try:
             # Extract
-            raw_data = await self.extract_market_data(ticker, days_back)
-            results['records_extracted'] = len(raw_data)
+            logger.info(f"Extracting EOD data for {ticker}")
+            raw_data = await self.extract_eod_data(ticker, lookback_days)
             
-            # Transform
-            features_df = self.transform_and_compute_features(raw_data, ticker)
-            results['features_computed'] = len(features_df.columns)
+            # Validate
+            clean_data = self.validate_eod_data(raw_data, ticker)
             
-            # Load
-            records_loaded = await self.load_to_database(features_df, ticker)
-            results['records_processed'] = records_loaded
+            # Load to database
+            records_to_insert = []
+            for _, row in clean_data.iterrows():
+                records_to_insert.append(row.to_dict())
             
-            results['success'] = True
-            logger.info(f"ETL pipeline completed for {ticker}: {results}")
+            records_inserted = self.db_manager.insert_eod_data(records_to_insert)
+            result['records_processed'] = records_inserted
+            
+            # Compute features
+            logger.info(f"Computing features for {ticker}")
+            features = self.feature_store.compute_eod_features(clean_data, ticker)
+            
+            # Save features
+            self.feature_store.save_eod_features(ticker, features)
+            result['features_computed'] = len(features.columns)
+            
+            # Save technical indicators separately for fast access
+            self.feature_store.save_technical_indicators(ticker, features)
+            
+            # Check data quality
+            gap_check = self.db_manager.check_data_gaps(
+                ticker, 
+                job_date - timedelta(days=lookback_days),
+                job_date
+            )
+            
+            if gap_check['missing_days'] > 0:
+                logger.warning(f"Data gaps found for {ticker}: {gap_check['missing_days']} days missing")
+                result['data_gaps'] = gap_check['missing_dates']
+            
+            result['success'] = True
+            self._complete_job(job_id, "SUCCESS", records_inserted)
+            
+            logger.info(f"EOD processing completed for {ticker}")
             
         except Exception as e:
-            results['errors'].append(str(e))
-            logger.error(f"ETL pipeline failed for {ticker}: {e}")
-            
-        return results
-    
-    async def run_batch_etl(self, tickers: List[str], days_back: int = 30) -> List[Dict]:
-        """Run ETL for multiple tickers in parallel"""
-        logger.info(f"Starting batch ETL for {len(tickers)} tickers")
+            error_msg = str(e)
+            result['errors'].append(error_msg)
+            self._complete_job(job_id, "FAILED", 0, 0, [error_msg])
+            logger.error(f"EOD processing failed for {ticker}: {e}")
         
+        return result
+    
+    async def run_daily_update(self, tickers: List[str]) -> Dict:
+        """Run daily EOD update for multiple tickers"""
+        if not self.market_calendar.is_trading_day(datetime.now()):
+            logger.info("Not a trading day, skipping daily update")
+            return {'status': 'skipped', 'reason': 'not_trading_day'}
+        
+        logger.info(f"Starting daily EOD update for {len(tickers)} tickers")
+        
+        # Process tickers in parallel
         tasks = []
         for ticker in tickers:
-            task = self.run_etl_for_ticker(ticker, days_back)
+            task = self.process_ticker_eod(ticker, lookback_days=30)  # Only update last 30 days
             tasks.append(task)
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Process results
+        # Summarize results
         successful = sum(1 for r in results if isinstance(r, dict) and r.get('success'))
         failed = len(results) - successful
+        total_records = sum(r.get('records_processed', 0) for r in results if isinstance(r, dict))
         
-        logger.info(f"Batch ETL completed: {successful} successful, {failed} failed")
-        
-        return results
-    
-    def schedule_etl_jobs(self):
-        """Schedule periodic ETL jobs"""
-        # Daily data refresh at 6 AM
-        schedule.every().day.at("06:00").do(
-            lambda: asyncio.run(self.run_batch_etl(['AAPL', 'MSFT', 'GOOGL'], 7))
-        )
-        
-        # Hourly updates during market hours
-        for hour in range(9, 17):  # 9 AM to 4 PM
-            schedule.every().day.at(f"{hour:02d}:30").do(
-                lambda: asyncio.run(self.run_batch_etl(['SPY'], 1))
-            )
-        
-        logger.info("ETL jobs scheduled")
-    
-    def calculate_data_quality_metrics(self, ticker: str, date: datetime) -> Dict:
-        """Calculate data quality metrics"""
-        metrics = {
-            'ticker': ticker,
-            'date': date,
-            'completeness_score': 0.0,
-            'accuracy_score': 0.0,
-            'timeliness_score': 0.0,
-            'consistency_score': 0.0,
-            'missing_data_points': 0,
-            'anomaly_count': 0
+        summary = {
+            'date': self.market_calendar.get_last_trading_day(),
+            'tickers_processed': len(tickers),
+            'successful': successful,
+            'failed': failed,
+            'total_records': total_records,
+            'results': results
         }
         
+        logger.info(f"Daily update completed: {successful}/{len(tickers)} successful")
+        
+        # Refresh materialized views
+        self._refresh_aggregates()
+        
+        return summary
+    
+    def _refresh_aggregates(self):
+        """Refresh materialized views for performance"""
         try:
-            # Get data for the date
-            start_time = date.replace(hour=0, minute=0, second=0)
-            end_time = date.replace(hour=23, minute=59, second=59)
-            
-            df = self.db_manager.get_market_data(ticker, start_time, end_time)
-            
-            if df.empty:
-                logger.warning(f"No data found for {ticker} on {date}")
-                return metrics
-            
-            # Completeness: Check for missing values
-            total_fields = len(df.columns) * len(df)
-            missing_values = df.isnull().sum().sum()
-            metrics['completeness_score'] = 1 - (missing_values / total_fields)
-            metrics['missing_data_points'] = missing_values
-            
-            # Accuracy: Check price relationships
-            valid_prices = ((df['high'] >= df['low']) & 
-                          (df['high'] >= df['open']) & 
-                          (df['high'] >= df['close'])).sum()
-            metrics['accuracy_score'] = valid_prices / len(df)
-            
-            # Timeliness: Check data recency
-            latest_update = df['time'].max()
-            delay_hours = (datetime.now(latest_update.tzinfo) - latest_update).total_seconds() / 3600
-            metrics['timeliness_score'] = max(0, 1 - (delay_hours / 24))
-            
-            # Consistency: Check for outliers
-            price_cols = ['open', 'high', 'low', 'close']
-            anomalies = 0
-            for col in price_cols:
-                mean = df[col].mean()
-                std = df[col].std()
-                outliers = ((df[col] - mean).abs() > (3 * std)).sum()
-                anomalies += outliers
-            
-            metrics['anomaly_count'] = anomalies
-            metrics['consistency_score'] = 1 - (anomalies / (len(df) * len(price_cols)))
-            
-            # Save metrics to database
             with self.db_manager.get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO data_quality_metrics (
-                        ticker, metric_date, completeness_score, accuracy_score,
-                        timeliness_score, consistency_score, missing_data_points,
-                        anomaly_count, metadata
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (ticker, metric_date) DO UPDATE SET
-                        completeness_score = EXCLUDED.completeness_score,
-                        accuracy_score = EXCLUDED.accuracy_score,
-                        timeliness_score = EXCLUDED.timeliness_score,
-                        consistency_score = EXCLUDED.consistency_score,
-                        missing_data_points = EXCLUDED.missing_data_points,
-                        anomaly_count = EXCLUDED.anomaly_count
-                """, (
-                    ticker, date.date(),
-                    metrics['completeness_score'],
-                    metrics['accuracy_score'],
-                    metrics['timeliness_score'],
-                    metrics['consistency_score'],
-                    metrics['missing_data_points'],
-                    metrics['anomaly_count'],
-                    json.dumps({'calculated_at': datetime.now().isoformat()})
-                ))
+                cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY eod_weekly_data")
+                cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY eod_monthly_data")
                 conn.commit()
-            
+                logger.info("Refreshed materialized views")
         except Exception as e:
-            logger.error(f"Failed to calculate data quality metrics: {e}")
-        
-        return metrics
+            logger.error(f"Failed to refresh materialized views: {e}")
     
-    def get_pipeline_stats(self) -> Dict:
-        """Get ETL pipeline statistics"""
+    def schedule_daily_job(self, tickers: List[str], run_time: str = "17:00"):
+        """Schedule daily EOD update job (default 5 PM EST after market close)"""
+        schedule.every().day.at(run_time).do(
+            lambda: asyncio.run(self.run_daily_update(tickers))
+        )
+        logger.info(f"Scheduled daily EOD update at {run_time} for {len(tickers)} tickers")
+    
+    def get_pipeline_health(self) -> Dict:
+        """Get pipeline health metrics"""
         with self.db_manager.get_connection() as conn:
             cur = conn.cursor(cursor_factory=RealDictCursor)
             
-            # Get job statistics
+            # Recent job status
             cur.execute("""
                 SELECT 
-                    job_type,
-                    status,
-                    COUNT(*) as count,
-                    AVG(EXTRACT(EPOCH FROM (end_time - start_time))) as avg_duration_seconds,
-                    SUM(records_processed) as total_records
-                FROM etl_jobs
-                WHERE start_time >= NOW() - INTERVAL '24 hours'
-                GROUP BY job_type, status
+                    COUNT(*) FILTER (WHERE status = 'SUCCESS') as successful_jobs,
+                    COUNT(*) FILTER (WHERE status = 'FAILED') as failed_jobs,
+                    AVG(execution_time_seconds) as avg_execution_time,
+                    MAX(job_date) as last_run_date
+                FROM eod_etl_jobs
+                WHERE job_date >= CURRENT_DATE - INTERVAL '7 days'
             """)
-            job_stats = cur.fetchall()
+            job_metrics = cur.fetchone()
             
-            # Get data volume statistics
+            # Data coverage
             cur.execute("""
                 SELECT 
-                    COUNT(DISTINCT ticker) as unique_tickers,
-                    COUNT(*) as total_records,
-                    MIN(time) as earliest_record,
-                    MAX(time) as latest_record
-                FROM market_data
+                    COUNT(DISTINCT ticker) as tickers_count,
+                    MIN(date) as earliest_date,
+                    MAX(date) as latest_date,
+                    COUNT(*) as total_records
+                FROM eod_market_data
             """)
-            data_stats = cur.fetchone()
+            data_coverage = cur.fetchone()
             
-            # Get feature store statistics
+            # Data quality
             cur.execute("""
                 SELECT 
-                    COUNT(DISTINCT feature_set_name) as feature_sets,
-                    COUNT(DISTINCT ticker) as tickers_with_features,
-                    COUNT(*) as total_feature_records
-                FROM feature_store
-                WHERE is_active = TRUE
+                    AVG(completeness_score) as avg_completeness,
+                    COUNT(*) FILTER (WHERE has_gaps = TRUE) as tickers_with_gaps
+                FROM eod_data_quality
+                WHERE date >= CURRENT_DATE - INTERVAL '7 days'
             """)
-            feature_stats = cur.fetchone()
+            quality_metrics = cur.fetchone()
             
             return {
-                'job_statistics': job_stats,
-                'data_statistics': data_stats,
-                'feature_statistics': feature_stats,
-                'active_jobs': len(self.jobs),
-                'pipeline_status': 'RUNNING' if self.running else 'STOPPED'
+                'job_metrics': job_metrics,
+                'data_coverage': data_coverage,
+                'quality_metrics': quality_metrics,
+                'pipeline_status': 'RUNNING' if self.running else 'STOPPED',
+                'last_check': datetime.now().isoformat()
             }
     
-    async def cleanup_old_data(self, days_to_keep: int = 730):
-        """Clean up old data beyond retention period"""
-        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    async def backfill_historical_data(self, ticker: str, years: int = 5) -> Dict:
+        """Backfill historical EOD data"""
+        logger.info(f"Starting historical backfill for {ticker} ({years} years)")
         
-        with self.db_manager.get_connection() as conn:
-            cur = conn.cursor()
-            
-            # Clean market data
-            cur.execute("""
-                DELETE FROM market_data 
-                WHERE time < %s
-                RETURNING COUNT(*)
-            """, (cutoff_date,))
-            
-            market_deleted = cur.fetchone()[0] if cur.rowcount > 0 else 0
-            
-            # Clean old feature versions
-            cur.execute("""
-                UPDATE feature_store 
-                SET is_active = FALSE 
-                WHERE time < %s AND is_active = TRUE
-                RETURNING COUNT(*)
-            """, (cutoff_date,))
-            
-            features_archived = cur.fetchone()[0] if cur.rowcount > 0 else 0
-            
-            # Clean old ETL jobs
-            cur.execute("""
-                DELETE FROM etl_jobs 
-                WHERE start_time < %s
-                RETURNING COUNT(*)
-            """, (cutoff_date,))
-            
-            jobs_deleted = cur.fetchone()[0] if cur.rowcount > 0 else 0
-            
-            conn.commit()
-            
-            logger.info(f"Cleanup completed: {market_deleted} market records, "
-                       f"{features_archived} features archived, {jobs_deleted} jobs deleted")
-            
-            return {
-                'market_records_deleted': market_deleted,
-                'features_archived': features_archived,
-                'jobs_deleted': jobs_deleted
-            }
-    
-    def export_to_parquet(self, ticker: str, output_path: str, 
-                         start_date: datetime, end_date: datetime):
-        """Export data to Parquet format for efficient storage"""
-        # Get market data
-        market_df = self.db_manager.get_market_data(ticker, start_date, end_date)
+        result = await self.process_ticker_eod(ticker, lookback_days=years * 252)
         
-        # Get features
-        features_df = self.feature_store.load_features(
-            ticker, start_date, end_date, "etl_pipeline"
-        )
-        
-        # Merge data
-        if not features_df.empty and not market_df.empty:
-            combined_df = pd.merge(
-                market_df, 
-                features_df, 
-                left_on='time', 
-                right_index=True, 
-                how='outer'
-            )
+        if result['success']:
+            logger.info(f"Backfill completed for {ticker}: {result['records_processed']} records")
         else:
-            combined_df = market_df
+            logger.error(f"Backfill failed for {ticker}: {result['errors']}")
         
-        # Write to Parquet
-        table = pa.Table.from_pandas(combined_df)
-        pq.write_table(table, output_path, compression='snappy')
-        
-        logger.info(f"Exported {len(combined_df)} records to {output_path}")
-        
-        return output_path
+        return result
     
     async def start(self):
-        """Start the ETL pipeline"""
+        """Start the EOD pipeline"""
         await self.initialize()
         self.running = True
-        self.schedule_etl_jobs()
         
-        logger.info("ETL Pipeline started")
+        logger.info("EOD ETL Pipeline started")
         
         # Run scheduled jobs
         while self.running:
@@ -1045,57 +1098,58 @@ class ETLPipeline:
             await asyncio.sleep(60)  # Check every minute
     
     def stop(self):
-        """Stop the ETL pipeline"""
+        """Stop the pipeline"""
         self.running = False
         self.executor.shutdown(wait=True)
-        
-        if self.market_data_manager:
-            asyncio.run(self.market_data_manager.close())
-        
-        logger.info("ETL Pipeline stopped")
+        logger.info("EOD ETL Pipeline stopped")
 
 # ======================== Main Execution ========================
 
 async def main():
-    """Main function to run the ETL pipeline"""
-    # Configure logging
+    """Main function for EOD pipeline"""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Create database configuration
-    db_config = DatabaseConfig()
+    # Create configuration
+    config = EODDatabaseConfig()
     
-    # Initialize ETL pipeline
-    pipeline = ETLPipeline(db_config)
+    # Initialize pipeline
+    pipeline = EODETLPipeline(config)
     
     try:
-        # Run initial batch ETL for key tickers
-        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-        results = await pipeline.run_batch_etl(tickers, days_back=30)
+        await pipeline.initialize()
         
-        # Print results
-        for result in results:
-            if isinstance(result, dict):
-                print(f"Ticker: {result['ticker']}, Success: {result['success']}, "
-                      f"Records: {result.get('records_processed', 0)}")
+        # Define tickers to track
+        tickers = [
+            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA',
+            'JPM', 'JNJ', 'V', 'PG', 'UNH',
+            'NVDA', 'META', 'BRK.B', 'XOM', 'LLY'
+        ]
         
-        # Calculate data quality metrics
-        for ticker in tickers:
-            metrics = pipeline.calculate_data_quality_metrics(ticker, datetime.now())
-            print(f"Data quality for {ticker}: Completeness={metrics['completeness_score']:.2f}, "
-                  f"Accuracy={metrics['accuracy_score']:.2f}")
+        # Run initial update
+        logger.info("Running initial EOD update...")
+        results = await pipeline.run_daily_update(tickers[:5])  # Start with 5 tickers
         
-        # Get pipeline statistics
-        stats = pipeline.get_pipeline_stats()
-        print(f"Pipeline stats: {json.dumps(stats, indent=2, default=str)}")
+        print(f"Initial update results: {json.dumps(results, indent=2, default=str)}")
         
-        # Start continuous pipeline
+        # Schedule daily updates
+        pipeline.schedule_daily_job(tickers, "17:00")
+        
+        # Get pipeline health
+        health = pipeline.get_pipeline_health()
+        print(f"Pipeline health: {json.dumps(health, indent=2, default=str)}")
+        
+        # Optional: Backfill historical data for one ticker
+        # backfill_result = await pipeline.backfill_historical_data('AAPL', years=2)
+        # print(f"Backfill result: {backfill_result}")
+        
+        # Start continuous operation
         await pipeline.start()
         
     except KeyboardInterrupt:
-        logger.info("Shutting down ETL pipeline...")
+        logger.info("Shutting down EOD pipeline...")
         pipeline.stop()
     except Exception as e:
         logger.error(f"Pipeline error: {e}")

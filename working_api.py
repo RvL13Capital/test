@@ -44,69 +44,30 @@ async def get_optimizer():
     return _optimizer
 
 async def _load_latest_model():
-    """Load the latest trained model from storage"""
-    gcs = get_gcs_storage()
-    if not gcs:
-        return
+    """
+    NEW: Load the latest production model from Model Registry
+    """
+    from .integrated_system import IntegratedMLTradingSystem, IntegratedSystemConfig
     
-    # Find latest model
-    models = gcs.list_models(prefix="models/breakout_predictor/")
-    if not models:
-        return
+    config = IntegratedSystemConfig()
+    system = IntegratedMLTradingSystem(config)
     
-    latest_model = max(models, key=lambda x: x['updated'])
-    model_path = latest_model['name']
-    
-    # Check cache
-    if model_path in _model_cache:
-        return _model_cache[model_path]
-    
-    # Load model state
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_state = gcs.download_pytorch_model(model_path, device=str(device))
-    
-    # Get model info from metadata
-    model_info = latest_model.get('metadata', {})
-    input_dim = model_info.get('input_dim', 14)  # Default feature count
-    
-    # Create model instance
-    from .breakout_strategy import BreakoutPredictor
-    model = BreakoutPredictor(
-        input_dim=input_dim,
-        hidden_dim=model_info.get('hidden_dim', 128),
-        n_layers=model_info.get('n_layers', 3),
-        dropout=model_info.get('dropout', 0.3)
-    )
-    model.load_state_dict(model_state)
-    model = model.to(device)
-    model.eval()
-    
-    # Load scaler
-    scaler_path = model_path.replace('model_', 'scaler_').replace('.pth', '.pkl')
+    # Get production model for a default ticker (e.g., market composite)
     try:
-        scaler = gcs.download_joblib(scaler_path)
-    except:
-        logger.warning("Scaler not found, using default")
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-    
-    # Update optimizer
-    optimizer = await get_optimizer()
-    optimizer.current_model = model
-    optimizer.current_scaler = scaler
-    
-    # Update adaptive thresholds if available
-    if 'adaptive_thresholds' in model_info:
-        optimizer.adaptive_thresholds = model_info['adaptive_thresholds']
-    
-    # Cache
-    _model_cache[model_path] = {
-        'model': model,
-        'scaler': scaler,
-        'loaded_at': datetime.now()
-    }
-    
-    logger.info(f"Loaded model from {model_path}")
+        model_info = await system.get_production_model_for_prediction('SPY', 'lstm')
+        
+        if model_info:
+            # Update optimizer with production model
+            optimizer = await get_optimizer()
+            optimizer.current_model = model_info['model']
+            optimizer.current_scaler = model_info.get('scaler')
+            
+            logger.info(f"Loaded production model version {model_info['version']}")
+        else:
+            logger.warning("No production model found in registry")
+            
+    except Exception as e:
+        logger.error(f"Failed to load production model: {e}")
 
 @breakout_api.route('/analyze/<ticker>', methods=['GET'])
 @jwt_required()

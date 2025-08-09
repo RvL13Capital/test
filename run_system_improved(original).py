@@ -255,46 +255,48 @@ class SystemManager:
         }
     
     async def initialize_components(self):
-    """
-    NEW: Initialize with integrated system
-    """
-    self.logger.info("🚀 Initializing Integrated ML Trading System...")
-    
-    from .integrated_system import IntegratedMLTradingSystem, IntegratedSystemConfig
-    
-    # Create integrated system config
-    config = IntegratedSystemConfig(
-        environment=os.getenv('ENVIRONMENT', 'production'),
-        db_host=os.getenv('DB_HOST', 'localhost'),
-        db_port=int(os.getenv('DB_PORT', '5432')),
-        db_name=os.getenv('DB_NAME', 'trading_eod_db'),
-        db_user=os.getenv('DB_USER', 'postgres'),
-        db_password=os.getenv('DB_PASSWORD'),
-        mlflow_uri=os.getenv('MLFLOW_TRACKING_URI', 'http://localhost:5001'),
-        redis_url=os.getenv('REDIS_URL', 'redis://localhost:6379'),
-        gcs_bucket=os.getenv('GCS_BUCKET_NAME', 'ml-trading-models'),
-        tickers=['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
-        optimization_interval_hours=24,
-        auto_deploy=os.getenv('AUTO_DEPLOY', 'false').lower() == 'true'
-    )
-    
-    # Create integrated system
-    self.integrated_system = IntegratedMLTradingSystem(config)
-    self.components['integrated_system'] = self.integrated_system
-    
-    # Initialize EOD pipeline
-    await self.integrated_system.eod_pipeline.initialize()
-    self.logger.info("✅ EOD Pipeline initialized")
-    
-    # Schedule daily pipeline
-    import schedule
-    schedule.every().day.at("17:30").do(
-        lambda: asyncio.run(self.integrated_system.run_daily_pipeline())
-    )
-    self.logger.info("✅ Daily pipeline scheduled")
-    
-    self.state = SystemState.RUNNING
-    self.logger.info("✅ Integrated system initialized successfully")
+        """Initialize all system components with error recovery"""
+        self.logger.info("🚀 Initializing ML Trading System components...")
+        
+        initialization_steps = [
+            ('storage', self._init_storage),
+            ('market_data', self._init_market_data),
+            ('redis', self._init_redis),
+            ('optimizer', self._init_optimizer),
+            ('monitoring', self._init_monitoring),
+            ('web_server', self._init_web_server)
+        ]
+        
+        for component_name, init_func in initialization_steps:
+            try:
+                self.logger.info(f"Initializing {component_name}...")
+                await init_func()
+                
+                self.metrics.component_health[component_name] = ComponentStatus(
+                    name=component_name,
+                    state='initialized',
+                    healthy=True,
+                    last_check=datetime.now(),
+                    details={}
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to initialize {component_name}: {e}")
+                
+                self.metrics.component_health[component_name] = ComponentStatus(
+                    name=component_name,
+                    state='error',
+                    healthy=False,
+                    last_check=datetime.now(),
+                    details={},
+                    error=str(e)
+                )
+                
+                if component_name in ['storage', 'web_server'] and not self.args.partial:
+                    raise RuntimeError(f"Critical component {component_name} failed to initialize")
+                elif self.args.partial:
+                    self.logger.warning(f"Running in partial mode without {component_name}")
+                    self.state = SystemState.DEGRADED
         
         # Check overall system health
         healthy_components = sum(1 for c in self.metrics.component_health.values() if c.healthy)

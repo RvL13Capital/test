@@ -187,43 +187,38 @@ class AutoOptimizer:
             raise ValueError(f"Initial model training failed: {result}")
     
     async def _collect_training_data(self, days_back: int = 365) -> List[pd.DataFrame]:
-    """
-    NEW: Collect training data from EOD Pipeline instead of yfinance
-    """
-    logger.info("Collecting training data from EOD database...")
-    
-    # Get integrated system
-    from .integrated_system import IntegratedMLTradingSystem, IntegratedSystemConfig
-    config = IntegratedSystemConfig()
-    system = IntegratedMLTradingSystem(config)
-    
-    # Get list of stocks with good data
-    candidates = await self._find_historical_breakouts(days_back)
-    
-    training_data = []
-    
-    for ticker in candidates[:50]:
-        try:
-            # Get from EOD pipeline
-            df = await system._get_training_data_from_eod(ticker, days_back)
-            
-            if len(df) > 100:
-                # Get features from feature store
-                df_features = await system._compute_features_from_eod(ticker, df)
+        """Collect historical data for training"""
+        logger.info("Collecting training data...")
+        
+        # Get list of stocks that had significant moves
+        candidates = await self._find_historical_breakouts(days_back)
+        
+        training_data = []
+        
+        # Parallel data collection
+        async def collect_stock_data(ticker: str) -> Optional[pd.DataFrame]:
+            try:
+                stock = yf.Ticker(ticker)
+                df = stock.history(period=f"{days_back}d")
                 
-                # Add labels
-                df_features['future_return_5d'] = df_features['close'].pct_change(5).shift(-5)
-                df_features['future_return_20d'] = df_features['close'].pct_change(20).shift(-20)
-                df_features['breakout_occurred'] = (df_features['future_return_20d'] > 0.3).astype(int)
-                
-                training_data.append(df_features)
-                
-        except Exception as e:
-            logger.error(f"Error collecting data for {ticker}: {e}")
-            continue
-    
-    logger.info(f"Collected training data for {len(training_data)} stocks from EOD database")
-    return training_data
+                if len(df) > 100:
+                    # Get market cap
+                    info = stock.info
+                    market_cap = info.get('marketCap', 500e6)
+                    
+                    # Extract features
+                    df_features = extract_consolidation_features(df, market_cap)
+                    
+                    # Add labels for supervised learning
+                    df_features['future_return_5d'] = df_features['close'].pct_change(5).shift(-5)
+                    df_features['future_return_20d'] = df_features['close'].pct_change(20).shift(-20)
+                    df_features['breakout_occurred'] = (df_features['future_return_20d'] > 0.3).astype(int)
+                    
+                    return df_features
+                    
+            except Exception as e:
+                logger.error(f"Error collecting data for {ticker}: {e}")
+                return None
         
         # Collect data in parallel
         tasks = [collect_stock_data(ticker) for ticker in candidates[:50]]
